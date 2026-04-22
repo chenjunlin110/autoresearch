@@ -196,7 +196,7 @@ class GPT(nn.Module):
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern)
         long_window = config.sequence_len
-        short_window = long_window // 8
+        short_window = long_window // 4
         char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
         window_sizes = []
         for layer_idx in range(config.n_layer):
@@ -435,7 +435,7 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "S"    # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**17 # ~131K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**18 # ~262K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -448,7 +448,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 9               # number of transformer layers
-DEVICE_BATCH_SIZE = 64   # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
