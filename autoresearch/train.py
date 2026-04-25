@@ -19,51 +19,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from kernels import get_kernel
+
+from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+
+# ---------------------------------------------------------------------------
+# Compatibility helpers for current workers / harness
+# ---------------------------------------------------------------------------
+
 COMPILE_ENABLED = os.environ.get("AUTORESEARCH_DISABLE_COMPILE", "1") != "1"
-
-
-def env_int(name, default, minimum=None):
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if minimum is not None and value < minimum:
-        raise ValueError(f"{name} must be >= {minimum}, got {value}")
-    return value
-
-
-def env_float(name, default, minimum=None):
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a float, got {raw!r}") from exc
-    if minimum is not None and value < minimum:
-        raise ValueError(f"{name} must be >= {minimum}, got {value}")
-    return value
-
-
-def env_str(name, default):
-    raw = os.environ.get(name)
-    return raw.strip() if isinstance(raw, str) and raw.strip() else default
-
-
-def env_float_pair(name, default):
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    parts = [part.strip() for part in raw.split(",")]
-    if len(parts) != 2:
-        raise ValueError(f"{name} must be '<float>,<float>', got {raw!r}")
-    try:
-        return tuple(float(part) for part in parts)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be '<float>,<float>', got {raw!r}") from exc
 
 
 def write_metrics(metrics):
@@ -77,20 +40,12 @@ def write_metrics(metrics):
         json.dump(metrics, handle, indent=2, sort_keys=True)
         handle.write("\n")
 
+
 def maybe_compile(target=None, **kwargs):
     if target is None:
         return lambda fn: maybe_compile(fn, **kwargs)
     return torch.compile(target, **kwargs) if COMPILE_ENABLED else target
 
-if not torch.cuda.is_available():
-    raise RuntimeError("autoresearch requires CUDA. Run inside the shared allocation or a GPU-enabled shell.")
-
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
-
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
 # ---------------------------------------------------------------------------
 # GPT Model
@@ -105,6 +60,12 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+
+
+cap = torch.cuda.get_device_capability()
+# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+fa3 = get_kernel(repo).flash_attn_interface
 
 
 def norm(x):
@@ -263,7 +224,7 @@ class GPT(nn.Module):
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern)
         long_window = config.sequence_len
-        short_window = 3 * long_window // 8
+        short_window = long_window // 2
         char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
         window_sizes = []
         for layer_idx in range(config.n_layer):
@@ -311,7 +272,7 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
             len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
-        # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
+        # Scale LR ∝ 1/\u221a(dmodel) (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
@@ -357,6 +318,7 @@ class GPT(nn.Module):
             return loss
         return logits
 
+
 # ---------------------------------------------------------------------------
 # Optimizer (MuonAdamW, single GPU only)
 # ---------------------------------------------------------------------------
@@ -369,6 +331,7 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+
 @maybe_compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
@@ -379,6 +342,7 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     denom = (exp_avg_sq / bias2).sqrt() + eps_t
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
+
 
 @maybe_compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
@@ -492,43 +456,48 @@ class MuonAdamW(torch.optim.Optimizer):
             elif group['kind'] == 'muon':
                 self._step_muon(group)
 
+
 # ---------------------------------------------------------------------------
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = env_int("AUTORESEARCH_ASPECT_RATIO", 64, minimum=1)       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = env_int("AUTORESEARCH_HEAD_DIM", 128, minimum=1)              # target head dimension for attention
-WINDOW_PATTERN = env_str("AUTORESEARCH_WINDOW_PATTERN", "S")             # sliding window pattern: L=full, S=half context
+ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = 128          # target head dimension for attention
+WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = env_int("AUTORESEARCH_TOTAL_BATCH_SIZE", 2**18, minimum=1)  # ~262K tokens per optimizer step
-EMBEDDING_LR = env_float("AUTORESEARCH_EMBEDDING_LR", 0.6, minimum=0.0)      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = env_float("AUTORESEARCH_UNEMBEDDING_LR", 0.004, minimum=0.0)  # learning rate for lm_head (Adam)
-MATRIX_LR = env_float("AUTORESEARCH_MATRIX_LR", 0.04, minimum=0.0)        # learning rate for matrix parameters (Muon)
-SCALAR_LR = env_float("AUTORESEARCH_SCALAR_LR", 0.5, minimum=0.0)         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = env_float("AUTORESEARCH_WEIGHT_DECAY", 0.2, minimum=0.0)   # cautious weight decay for Muon
-ADAM_BETAS = env_float_pair("AUTORESEARCH_ADAM_BETAS", (0.8, 0.95))       # Adam beta1, beta2
-WARMUP_RATIO = env_float("AUTORESEARCH_WARMUP_RATIO", 0.0, minimum=0.0)   # fraction of time budget for LR warmup
-WARMDOWN_RATIO = env_float("AUTORESEARCH_WARMDOWN_RATIO", 0.7, minimum=0.0)    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = env_float("AUTORESEARCH_FINAL_LR_FRAC", 0.0, minimum=0.0) # final LR as fraction of initial
+TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
+UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
+MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
+SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
+WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
+ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
+WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
+WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
+FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = env_int("AUTORESEARCH_DEPTH", 9, minimum=1)                        # number of transformer layers
-DEVICE_BATCH_SIZE = env_int("AUTORESEARCH_DEVICE_BATCH_SIZE", 128, minimum=1)  # per-device batch size (reduce if OOM)
+DEPTH = 8               # number of transformer layers
+DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
 
+if not torch.cuda.is_available():
+    raise RuntimeError("autoresearch requires CUDA. Run inside the shared allocation or a GPU-enabled shell.")
+
 t_start = time.time()
-SEED = env_int("AUTORESEARCH_SEED", 42, minimum=0)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed(SEED)
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 H100_BF16_PEAK_FLOPS = 989.5e12
+
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -544,6 +513,7 @@ def build_model_config(depth):
         window_pattern=WINDOW_PATTERN,
     )
 
+
 config = build_model_config(DEPTH)
 print(f"Model config: {asdict(config)}")
 
@@ -558,7 +528,8 @@ for key, value in param_counts.items():
     print(f"  {key:24s}: {value:,}")
 num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+print(f"Estimated FLOPs per token: {num_flops_per_token:e}
+")
 
 tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
 assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
@@ -585,7 +556,6 @@ x, y, epoch = next(train_loader)  # prefetch first batch
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
-# Schedules (all based on progress = training_time / TIME_BUDGET)
 
 def get_lr_multiplier(progress):
     if progress < WARMUP_RATIO:
@@ -596,12 +566,15 @@ def get_lr_multiplier(progress):
         cooldown = (1.0 - progress) / WARMDOWN_RATIO
         return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
+
 def get_muon_momentum(step):
     frac = min(step / 300, 1)
     return (1 - frac) * 0.85 + frac * 0.95
 
+
 def get_weight_decay(progress):
     return WEIGHT_DECAY * (1 - progress)
+
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -701,7 +674,7 @@ print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
 
-metrics = {
+write_metrics({
     "val_bpb": val_bpb,
     "training_seconds": total_training_time,
     "total_seconds": t_end - t_start,
@@ -714,8 +687,7 @@ metrics = {
     "time_budget_seconds": TIME_BUDGET,
     "compile_enabled": COMPILE_ENABLED,
     "device_name": torch.cuda.get_device_name(0),
-    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
-    "seed": SEED,
+    "seed": 42,
     "config": {
         "aspect_ratio": ASPECT_RATIO,
         "head_dim": HEAD_DIM,
@@ -732,5 +704,4 @@ metrics = {
         "final_lr_frac": FINAL_LR_FRAC,
         "device_batch_size": DEVICE_BATCH_SIZE,
     },
-}
-write_metrics(metrics)
+})
