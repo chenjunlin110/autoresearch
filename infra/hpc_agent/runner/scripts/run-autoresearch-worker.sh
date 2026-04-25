@@ -69,4 +69,17 @@ set -e
   echo "metrics_path=$AUTORESEARCH_METRICS_PATH"
 } > "$output_dir/result.txt"
 
+if [[ -n "${AUTORESEARCH_RESULTS_PATH:-}" ]]; then
+  val_bpb="$(python3 -c "import json; d=json.load(open('$AUTORESEARCH_METRICS_PATH')); print(d.get('val_bpb',''))" 2>/dev/null || true)"
+  if [[ ! -f "$AUTORESEARCH_RESULTS_PATH" ]]; then
+    printf 'timestamp\trun_id\tval_bpb\texit_code\toutput_dir\n' > "$AUTORESEARCH_RESULTS_PATH"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$timestamp" \
+    "$(basename "$output_dir")" \
+    "${val_bpb:-}" \
+    "$exit_code" \
+    "$output_dir" >> "$AUTORESEARCH_RESULTS_PATH"
+fi
+
 exit "$exit_code"

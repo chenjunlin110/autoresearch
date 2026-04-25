@@ -38,6 +38,7 @@ export function buildAutoresearchDagFullPaths({
     projectRoot,
     repoRoot,
     expOutputDir,
+    resultsPath: path.join(expOutputDir, 'results.tsv'),
     experimentName,
     readmePath: path.join(repoRoot, 'README.md'),
     managerProgramPath: path.join(repoRoot, 'program.md'),
@@ -366,9 +367,11 @@ export function renderAutoresearchFullExperimentWorkerSkill({
   workerScriptPath,
   sandboxScriptPath,
   timeBudgetSeconds = 300,
+  resultsPath = null,
 } = {}) {
   if (!workerScriptPath) throw new Error('workerScriptPath is required');
   if (!sandboxScriptPath) throw new Error('sandboxScriptPath is required');
+  const resultsEnv = resultsPath ? ` and \`AUTORESEARCH_RESULTS_PATH=${resultsPath}\`` : '';
 
   return `---
 reports_to: manager
@@ -386,7 +389,7 @@ Rules:
 - Respect the full requested resource shape. A task may legitimately ask for multiple GPUs or extra CPUs.
 - Use \`${workerScriptPath}\`.
 - If the task requests code edits, create the git-managed experiment repo with \`${sandboxScriptPath}\`, first run \`git checkout -B <experiment_id>\`, and edit only that repo's \`train.py\`.
-- Always set \`AUTORESEARCH_TIME_BUDGET_SECONDS=${timeBudgetSeconds}\` and \`AUTORESEARCH_DISABLE_COMPILE=1\`.
+- Always set \`AUTORESEARCH_TIME_BUDGET_SECONDS=${timeBudgetSeconds}\` and \`AUTORESEARCH_DISABLE_COMPILE=1\`${resultsEnv}.
 - If the task asks for additional \`AUTORESEARCH_*\` overrides, set them exactly, except do not change the fixed time budget.
 - Use the exact output directory requested by the manager.
 - Write \`experiment.md\` before running.
@@ -487,6 +490,7 @@ export function createAutoresearchDagFullWorkspace(options = {}) {
       workerScriptPath,
       sandboxScriptPath,
       timeBudgetSeconds,
+      resultsPath: toPosix(paths.resultsPath),
     }), 'utf8');
   }
   writeFileSync(paths.mayaSkillPath, renderAutoresearchFullAnalysisWorkerSkill(), 'utf8');

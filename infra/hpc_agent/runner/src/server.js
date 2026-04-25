@@ -435,16 +435,7 @@ class ProjectRunner {
     this.lastComputedSleepMs = null; // Cached sleep interval
     this.currentSchedule = null;
     this.abortCurrentCycle = false;
-    // Phase state machine: athena | implementation | verification | examination
-    this.phase = 'athena'; // Start by asking Athena for first milestone
-    this.milestoneTitle = null;
-    this.milestoneDescription = null;
-    this.milestoneCyclesBudget = 0;
-    this.milestoneCyclesUsed = 0;
-    this.verificationFeedback = null;
-    this.examinationFeedback = null;
-    this.pendingCompletionMessage = null;
-    this.isFixRound = false; // true when returning from failed verification
+    this.phase = 'idle';
     this.isComplete = false;
     this.completionSuccess = false;
     this.completionMessage = null;
@@ -479,11 +470,6 @@ class ProjectRunner {
       this.sleepUntil = null;
       this.lastComputedSleepMs = null;
     }
-    // 3. Phase reset: when entering athena phase, clear implementation/verification state
-    if (patch.phase === 'athena' && !patch.milestoneDescription) {
-      // Don't clear milestone info if it wasn't explicitly set — Athena needs context
-    }
-
     if (save) this.saveState();
 
     // Broadcast status update via SSE for instant dashboard refresh
@@ -1109,7 +1095,7 @@ class ProjectRunner {
     if (issueCreator === 'human' || issueCreator === 'chat') {
       return { allowed: new Set(['human', 'chat']), special: 'chat-human' };
     }
-    return { allowed: new Set([issueCreator, 'athena']), special: 'agent-athena' };
+    return { allowed: new Set([issueCreator]), special: 'agent' };
   }
 
   getDb() {
@@ -1323,11 +1309,6 @@ class ProjectRunner {
       sleepUntil: this.isPaused ? null : this.sleepUntil,
       schedule: this.currentSchedule || null,
       phase: this.phase,
-      milestoneTitle: this.milestoneTitle,
-      milestone: this.milestoneDescription,
-      milestoneCyclesBudget: this.milestoneCyclesBudget,
-      milestoneCyclesUsed: this.milestoneCyclesUsed,
-      isFixRound: this.isFixRound,
       isComplete: this.isComplete || false,
       completionSuccess: this.completionSuccess || false,
       completionMessage: this.completionMessage || null,
@@ -1375,19 +1356,11 @@ class ProjectRunner {
     log(`Cleared project operational state`, this.id);
     fs.mkdirSync(this.projectDir, { recursive: true });
 
-    // 2. Reset cycle count, phase, and save state
+    // 2. Reset cycle count and save state
     this.setState({
       cycleCount: 0,
       epochCount: 0,
-      phase: 'athena',
-      milestoneTitle: null,
-      milestoneDescription: null,
-      milestoneCyclesBudget: 0,
-      milestoneCyclesUsed: 0,
-      verificationFeedback: null,
-      examinationFeedback: null,
-      pendingCompletionMessage: null,
-      isFixRound: false,
+      phase: 'idle',
       isComplete: false,
       completionSuccess: false,
       completionMessage: null,
@@ -1553,22 +1526,13 @@ class ProjectRunner {
         this.currentCycleId = state.currentCycleId || null;
         this.currentSchedule = state.currentSchedule || null;
         if (state.isPaused !== undefined) this.isPaused = state.isPaused;
-        // Phase state
-        this.phase = state.phase || 'athena';
-        this.milestoneTitle = state.milestoneTitle || null;
-        this.milestoneDescription = state.milestoneDescription || null;
-        this.milestoneCyclesBudget = state.milestoneCyclesBudget || 0;
-        this.milestoneCyclesUsed = state.milestoneCyclesUsed || 0;
-        this.verificationFeedback = state.verificationFeedback || null;
-        this.examinationFeedback = state.examinationFeedback || null;
-        this.pendingCompletionMessage = state.pendingCompletionMessage || null;
-        this.isFixRound = state.isFixRound || false;
+        this.phase = state.phase || 'idle';
         this.isComplete = state.isComplete || false;
         this.completionSuccess = state.completionSuccess || false;
         this.completionMessage = state.completionMessage || null;
         this.resourceOrchestrationSnapshot = state.resourceOrchestration || null;
         this._resetTaskGraphRunningTasks(this.currentSchedule);
-        log(`Loaded state: cycle ${this.cycleCount}, phase: ${this.phase}, completed: [${this.completedAgents.join(', ')}]${this.isPaused ? ', paused' : ''}`, this.id);
+        log(`Loaded state: cycle ${this.cycleCount}, completed: [${this.completedAgents.join(', ')}]${this.isPaused ? ', paused' : ''}`, this.id);
       } else {
         // New project — start paused
         this.setState({ isPaused: true, pauseReason: 'New project (paused by default)' }, { save: false });
@@ -1598,14 +1562,6 @@ class ProjectRunner {
         currentSchedule: this.currentSchedule || null,
         isPaused: this.isPaused || false,
         phase: this.phase,
-        milestoneTitle: this.milestoneTitle,
-        milestoneDescription: this.milestoneDescription,
-        milestoneCyclesBudget: this.milestoneCyclesBudget,
-        milestoneCyclesUsed: this.milestoneCyclesUsed,
-        verificationFeedback: this.verificationFeedback,
-        examinationFeedback: this.examinationFeedback,
-        pendingCompletionMessage: this.pendingCompletionMessage,
-        isFixRound: this.isFixRound,
         isComplete: this.isComplete || false,
         completionSuccess: this.completionSuccess || false,
         completionMessage: this.completionMessage || null,
@@ -1638,14 +1594,7 @@ class ProjectRunner {
         completionMessage: null,
         isPaused: false,
         pauseReason: null,
-        phase: 'athena',
-        milestoneTitle: null,
-        milestoneDescription: null,
-        milestoneCyclesBudget: 0,
-        milestoneCyclesUsed: 0,
-        verificationFeedback: null,
-        examinationFeedback: null,
-        pendingCompletionMessage: null,
+        phase: 'idle',
         currentSchedule: null,
         completedAgents: [],
       });
@@ -1685,20 +1634,12 @@ class ProjectRunner {
 
   // Kill Epoch: terminate everything + force back to Athena
   killEpoch() {
-    log(`🔴 Kill Epoch: terminating agent, clearing schedule, returning to Athena`, this.id);
+    log(`🔴 Kill Epoch: terminating agent, clearing schedule`, this.id);
     this.abortCurrentCycle = true;
     this._abortAllRuns();
     this.currentSchedule = null;
     this.completedAgents = [];
-    this.setState({
-      phase: 'athena',
-      milestoneTitle: null,
-      milestoneDescription: null,
-      milestoneCyclesBudget: 0,
-      milestoneCyclesUsed: 0,
-      verificationFeedback: null,
-      isFixRound: false,
-    });
+    this.saveState();
   }
 
   // Wait while paused, auto-resuming after intervalMs. Optional condition check to resume early.
@@ -2698,17 +2639,13 @@ class ProjectRunner {
 
     const maxManagerPasses = orchestration.maxManagerPasses || 8;
     const maxWallClockSeconds = orchestration.maxWallClockSeconds ?? null;
-    const cycleStartTime = Date.now();
     let cycleFailures = 0;
     let cycleTotal = 0;
 
     for (let managerPass = 0; managerPass < maxManagerPasses && this.running && !this.abortCurrentCycle; managerPass += 1) {
-      if (maxWallClockSeconds != null) {
-        const elapsedSeconds = (Date.now() - cycleStartTime) / 1000;
-        if (elapsedSeconds >= maxWallClockSeconds) {
-          log(`Wall-clock limit reached (${Math.floor(elapsedSeconds)}s >= ${maxWallClockSeconds}s), stopping`, this.id);
-          return { cycleTotal, cycleFailures };
-        }
+      if (maxWallClockSeconds != null && (Date.now() - startTime) / 1000 >= maxWallClockSeconds) {
+        log(`Wall-clock limit reached (${Math.floor((Date.now() - startTime) / 1000)}s >= ${maxWallClockSeconds}s), stopping`, this.id);
+        return { cycleTotal, cycleFailures };
       }
       if (this.currentSchedule) {
         log(`Resuming interrupted single-manager schedule (${this.completedAgents.length} completed)`, this.id);
@@ -2858,393 +2795,6 @@ class ProjectRunner {
           this.wakeNow = false;
         }
         continue;
-      }
-
-      // ===== PHASE: ATHENA (strategy) =====
-      if (this.phase === 'athena') {
-        const athena = managers.find(m => m.name === 'athena');
-        if (athena) {
-          // Build situation context for Athena
-          let situation = '';
-          if (this.examinationFeedback) {
-            situation = `> **Situation: Project Completion Rejected by Themis**\n> ${this.examinationFeedback}\n\n`;
-          } else if (!this.milestoneDescription) {
-            situation = '> **Situation: Project Just Started**\n\n';
-          } else if (this.verificationFeedback === '__passed__') {
-            situation = '> **Situation: Milestone Verified Complete**\n> Previous milestone was verified by Apollo\'s team.\n\n';
-          } else {
-            situation = `> **Situation: Implementation Deadline Missed**\n> Ares's team used ${this.milestoneCyclesUsed}/${this.milestoneCyclesBudget} cycles without completing the milestone.\n\n`;
-          }
-
-          const result = await this.runAgent(athena, config, null, situation);
-          cycleTotal++;
-          if (!result || !result.success) cycleFailures++;
-
-          // Parse schedule and milestone from Athena's response
-          let schedule = null;
-          if (result && result.resultText) {
-            schedule = this.parseSchedule(result.resultText);
-            if (schedule) {
-              log(`Schedule: ${JSON.stringify(schedule)}`, this.id);
-            }
-
-            const milestoneMatch = result.resultText.match(/<!-- MILESTONE -->\s*([\s\S]*?)\s*<!-- \/MILESTONE -->/);
-            if (milestoneMatch) {
-              try {
-                const milestone = JSON.parse(milestoneMatch[1]);
-                this.setState({
-                  milestoneTitle: milestone.title || milestone.description.slice(0, 80),
-                  milestoneDescription: milestone.description,
-                  milestoneCyclesBudget: milestone.cycles || 20,
-                  milestoneCyclesUsed: 0,
-                  verificationFeedback: null,
-                  examinationFeedback: null,
-                  pendingCompletionMessage: null,
-                  isFixRound: false,
-                  phase: 'implementation',
-                });
-                this.epochCount++;
-                this.saveState();
-                log(`Epoch ${this.epochCount}: New milestone (${this.milestoneCyclesBudget} cycles): ${this.milestoneDescription.slice(0, 100)}...`, this.id);
-                broadcastEvent({ type: 'milestone', project: this.id, title: this.milestoneTitle, cycles: this.milestoneCyclesBudget });
-              } catch (e) {
-                log(`Failed to parse milestone: ${e.message}`, this.id);
-              }
-            }
-            // Check for PROJECT_COMPLETE tag
-            const completeMatch = result.resultText.match(/<!-- PROJECT_COMPLETE -->\s*([\s\S]*?)\s*<!-- \/PROJECT_COMPLETE -->/);
-            if (completeMatch) {
-              try {
-                const completion = JSON.parse(completeMatch[1]);
-                const success = !!completion.success;
-                const message = completion.message || 'Project completed';
-                if (success) {
-                  this.setState({
-                    phase: 'examination',
-                    pendingCompletionMessage: message,
-                    examinationFeedback: null,
-                    completionSuccess: false,
-                    completionMessage: null,
-                    isComplete: false,
-                    isPaused: false,
-                    pauseReason: null,
-                  });
-                  log(`🧪 PROJECT COMPLETE claimed — routing to Themis examination: ${message}`, this.id);
-                  broadcastEvent({ type: 'phase', project: this.id, phase: 'examination', title: this.milestoneTitle || 'Project examination' });
-                } else {
-                  this.setState({
-                    isComplete: true,
-                    completionSuccess: success,
-                    completionMessage: message,
-                    isPaused: true,
-                    pauseReason: `Project ${success ? 'completed successfully' : 'ended'}: ${message}`,
-                  });
-                  log(`🏁 PROJECT COMPLETE (success: ${success}): ${message}`, this.id);
-                  broadcastEvent({ type: 'project-complete', project: this.id, success, message });
-                }
-                continue;
-              } catch (e) {
-                log(`Failed to parse PROJECT_COMPLETE: ${e.message}`, this.id);
-              }
-            }
-
-            // Check for STOP file
-            if (fs.existsSync(this.stopPath)) {
-              log(`STOP file detected — pausing project`, this.id);
-              this.setState({ isPaused: true, pauseReason: 'Project stopped by Athena' });
-              continue;
-            }
-          }
-
-          // Execute schedule steps (delays + workers)
-          if (schedule) {
-            this.currentSchedule = schedule;
-            this.saveState(); // Persist schedule before execution so it survives reboot
-            const { total, failures } = await this.executeSchedule(schedule, config, 'athena');
-            cycleTotal += total;
-            cycleFailures += failures;
-          }
-
-          this.saveState();
-        }
-      }
-
-      // ===== PHASE: IMPLEMENTATION (Ares + his workers) =====
-      else if (this.phase === 'implementation') {
-        // Check if deadline missed (before running)
-        if (this.milestoneCyclesUsed >= this.milestoneCyclesBudget) {
-          log(`⏰ Implementation deadline missed (${this.milestoneCyclesUsed}/${this.milestoneCyclesBudget} cycles)`, this.id);
-          this.setState({ phase: 'athena' });
-          continue;
-        }
-
-        // Resume interrupted schedule from previous cycle (e.g. after reboot)
-        // Note: don't require completedAgents — schedule may start with a delay step
-        if (this.currentSchedule) {
-          log(`Resuming interrupted schedule (${this.completedAgents.length} agents already completed${this.completedAgents.length ? ': [' + this.completedAgents.join(', ') + ']' : ''})`, this.id);
-          const { total, failures } = await this.executeSchedule(this.currentSchedule, config, 'ares');
-          cycleTotal += total;
-          cycleFailures += failures;
-          this.currentSchedule = null;
-          this.completedAgents = [];
-          this.saveState();
-        } else {
-
-        const ares = managers.find(m => m.name === 'ares');
-        if (ares) {
-          // Build context for Ares (remaining includes this cycle)
-          const cyclesRemaining = this.milestoneCyclesBudget - this.milestoneCyclesUsed;
-          let aresContext = `> **Milestone:** ${this.milestoneDescription}\n> **Cycles remaining:** ${cyclesRemaining} of ${this.milestoneCyclesBudget}\n\n`;
-          if (this.isFixRound && this.verificationFeedback) {
-            aresContext += `> **⚠️ Verification Failed — Fix Required:**\n> ${this.verificationFeedback}\n> You have ${this.milestoneCyclesBudget - this.milestoneCyclesUsed} cycles to fix and re-claim.\n\n`;
-          }
-
-          const result = await this.runAgent(ares, config, null, aresContext);
-          cycleTotal++;
-          if (!result || !result.success) cycleFailures++;
-
-          // Parse schedule and check for CLAIM_COMPLETE
-          let schedule = null;
-          if (result && result.resultText) {
-            schedule = this.parseSchedule(result.resultText);
-            if (schedule) {
-              log(`Schedule: ${JSON.stringify(schedule)}`, this.id);
-              this.currentSchedule = schedule;
-            }
-
-            // Check if Ares claims milestone complete
-            if (result.resultText.includes('<!-- CLAIM_COMPLETE -->')) {
-              log(`🎯 Ares claims milestone complete — switching to verification`, this.id);
-              this.setState({ phase: 'verification' });
-              broadcastEvent({ type: 'phase', project: this.id, phase: 'verification', title: this.milestoneTitle });
-            }
-          }
-
-          // Execute schedule steps (delays + workers)
-          if (schedule) {
-            this.completedAgents = [];
-            this.saveState(); // Persist schedule before execution so it survives reboot
-            const { total, failures } = await this.executeSchedule(schedule, config, 'ares');
-            cycleTotal += total;
-            cycleFailures += failures;
-            this.currentSchedule = null;
-            this.completedAgents = [];
-            this.saveState();
-          }
-        }
-        } // end else (no interrupted schedule)
-        // Only count cycle if at least one agent succeeded
-        if (cycleTotal > 0 && cycleFailures < cycleTotal) {
-          this.milestoneCyclesUsed++;
-        } else if (cycleTotal > 0) {
-          log(`All ${cycleTotal} agents failed — cycle not counted toward milestone budget`, this.id);
-        }
-        this.saveState();
-      }
-
-      // ===== PHASE: VERIFICATION (Apollo + his workers) =====
-      else if (this.phase === 'verification') {
-        // Resume interrupted verification schedule (e.g. after reboot)
-        if (this.currentSchedule && this.completedAgents.length > 0) {
-          log(`Resuming interrupted verification schedule (${this.completedAgents.length} agents already completed: [${this.completedAgents.join(', ')}])`, this.id);
-          const { total, failures } = await this.executeSchedule(this.currentSchedule, config, 'apollo');
-          cycleTotal += total;
-          cycleFailures += failures;
-          this.currentSchedule = null;
-          this.completedAgents = [];
-          this.saveState();
-        } else {
-        const apollo = managers.find(m => m.name === 'apollo');
-        if (apollo) {
-          const apolloContext = `> **Milestone to verify:** ${this.milestoneDescription}\n\n`;
-
-          const result = await this.runAgent(apollo, config, null, apolloContext);
-          cycleTotal++;
-          if (!result || !result.success) cycleFailures++;
-
-          let schedule = null;
-          let decision = null;
-          if (result && result.resultText) {
-            schedule = this.parseSchedule(result.resultText);
-            if (schedule) {
-              log(`Schedule: ${JSON.stringify(schedule)}`, this.id);
-            }
-
-            // Check for verification decision
-            if (result.resultText.includes('<!-- VERIFY_PASS -->')) {
-              decision = 'pass';
-            }
-            const failMatch = result.resultText.match(/<!-- VERIFY_FAIL -->\s*([\s\S]*?)\s*<!-- \/VERIFY_FAIL -->/);
-            if (failMatch) {
-              try {
-                const failData = JSON.parse(failMatch[1]);
-                decision = 'fail';
-                this.verificationFeedback = failData.feedback || 'Verification failed (no specific feedback)';
-              } catch {
-                decision = 'fail';
-                this.verificationFeedback = 'Verification failed (could not parse feedback)';
-              }
-            }
-          }
-
-          // Execute schedule steps (delays + workers)
-          if (schedule) {
-            this.currentSchedule = schedule;
-            this.completedAgents = [];
-            this.saveState(); // Persist schedule before execution so it survives reboot
-            const { total, failures } = await this.executeSchedule(schedule, config, 'apollo');
-            cycleTotal += total;
-            cycleFailures += failures;
-            this.currentSchedule = null;
-            this.completedAgents = [];
-            this.saveState();
-          }
-
-          // Process decision
-          if (decision === 'pass') {
-            log(`✅ Milestone verified — waking Athena for next milestone`, this.id);
-            broadcastEvent({ type: 'verified', project: this.id, title: this.milestoneTitle });
-            this.milestoneTitle = null;
-            this.setState({
-              milestoneTitle: null,
-              milestoneDescription: null,
-              milestoneCyclesBudget: 0,
-              milestoneCyclesUsed: 0,
-              verificationFeedback: null,
-              isFixRound: false,
-              phase: 'athena',
-            });
-          } else if (decision === 'fail') {
-            log(`❌ Verification failed — returning to Ares (${Math.floor(this.milestoneCyclesBudget / 2)} fix cycles)`, this.id);
-            broadcastEvent({ type: 'verify-fail', project: this.id, title: this.milestoneTitle });
-            const fixBudget = Math.floor(this.milestoneCyclesBudget / 2);
-            this.setState({
-              milestoneCyclesBudget: this.milestoneCyclesUsed + fixBudget,
-              isFixRound: true,
-              phase: 'implementation',
-            });
-          } else {
-            // No decision yet, stay in verification phase — still save
-            this.saveState();
-          }
-        }
-        } // end else (no interrupted verification schedule)
-      }
-
-      // ===== PHASE: EXAMINATION (Themis final audit) =====
-      else if (this.phase === 'examination') {
-        // Resume interrupted examination schedule (e.g. after reboot)
-        if (this.currentSchedule) {
-          log(`Resuming interrupted examination schedule (${this.completedAgents.length} agents already completed${this.completedAgents.length ? ': [' + this.completedAgents.join(', ') + ']' : ''})`, this.id);
-          const { total, failures } = await this.executeSchedule(this.currentSchedule, config, 'themis');
-          cycleTotal += total;
-          cycleFailures += failures;
-          this.currentSchedule = null;
-          this.completedAgents = [];
-          this.saveState();
-        } else {
-        const themis = managers.find(m => m.name === 'themis');
-        if (themis) {
-          const themisContext = `> **Final completion claim:** ${this.pendingCompletionMessage || 'Project claimed complete'}\n> **Evaluate the entire project, not just the human\'s explicit goal.** Audit correctness, completeness, maintainability, artifacts, tests, docs, and obvious risks.\n\n`;
-          const result = await this.runAgent(themis, config, null, themisContext, { mode: 'full', issues: [] });
-          cycleTotal++;
-          if (!result || !result.success) cycleFailures++;
-
-          let schedule = null;
-          let decision = null;
-          let failData = null;
-          if (result && result.resultText) {
-            schedule = this.parseSchedule(result.resultText);
-            if (schedule) {
-              log(`Schedule: ${JSON.stringify(schedule)}`, this.id);
-            }
-
-            if (result.resultText.includes('<!-- EXAM_PASS -->')) {
-              decision = 'pass';
-            }
-            const failMatch = result.resultText.match(/<!-- EXAM_FAIL -->\s*([\s\S]*?)\s*<!-- \/EXAM_FAIL -->/);
-            if (failMatch) {
-              try {
-                failData = JSON.parse(failMatch[1]);
-              } catch {
-                failData = { feedback: 'Themis rejected project completion, but the response could not be parsed.' };
-              }
-              decision = 'fail';
-            } else if (!schedule) {
-              decision = 'fail';
-            }
-          }
-
-          if (schedule) {
-            this.currentSchedule = schedule;
-            this.completedAgents = [];
-            this.saveState();
-            const { total, failures } = await this.executeSchedule(schedule, config, 'themis');
-            cycleTotal += total;
-            cycleFailures += failures;
-            this.currentSchedule = null;
-            this.completedAgents = [];
-            this.saveState();
-          }
-
-          if (decision === 'pass') {
-            const message = this.pendingCompletionMessage || 'Project completed';
-            this.setState({
-              phase: 'athena',
-              isComplete: true,
-              completionSuccess: true,
-              completionMessage: message,
-              pendingCompletionMessage: null,
-              examinationFeedback: null,
-              currentSchedule: null,
-              completedAgents: [],
-              isPaused: true,
-              pauseReason: `Project completed successfully: ${message}`,
-            });
-            log(`🏁 PROJECT COMPLETE (validated by Themis): ${message}`, this.id);
-            broadcastEvent({ type: 'project-complete', project: this.id, success: true, message });
-          } else if (decision === 'fail') {
-            let issues = Array.isArray(failData?.issues) ? failData.issues : [];
-            const rawFeedback = (result?.resultText || '').trim();
-            if (issues.length === 0) {
-              issues = [{
-                title: 'Themis rejected project completion',
-                body: rawFeedback || failData?.feedback || failData?.summary || 'Themis did not issue EXAM_PASS, so the completion claim was rejected.',
-              }];
-            }
-            const createdIssueIds = [];
-            for (const issue of issues) {
-              if (!issue?.title) continue;
-              try {
-                const created = await this.createIssue(issue.title, issue.body || '', 'themis');
-                createdIssueIds.push(created.issueId);
-              } catch (e) {
-                log(`Themis issue creation failed: ${e.message}`, this.id);
-              }
-            }
-            const feedback = failData?.feedback || failData?.summary || rawFeedback || 'Themis rejected the project completion claim.';
-            this.setState({
-              phase: 'athena',
-              examinationFeedback: createdIssueIds.length
-                ? `${feedback} New issues: ${createdIssueIds.map(id => `#${id}`).join(', ')}`
-                : feedback,
-              pendingCompletionMessage: null,
-              currentSchedule: null,
-              completedAgents: [],
-              isComplete: false,
-              completionSuccess: false,
-              completionMessage: null,
-              isPaused: false,
-              pauseReason: null,
-            });
-            log(`❌ Themis rejected project completion — returning to Athena`, this.id);
-            broadcastEvent({ type: 'phase', project: this.id, phase: 'athena', title: this.milestoneTitle || 'Replanning after Themis rejection' });
-          } else {
-            // No decision yet, stay in examination phase — still save
-            this.saveState();
-          }
-        }
-        } // end else (no interrupted examination schedule)
       }
 
       // If no agent succeeded, don't count this cycle
