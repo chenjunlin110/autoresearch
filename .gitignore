@@ -15,9 +15,14 @@ queue/
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
 AGENTS.md
+.codex
+.codex/
 
 # Experimental code/artifacts
 dev/
+artifacts/
+.hf-home/
+*.log
 
 # Results file
 results.tsv

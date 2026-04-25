@@ -27,15 +27,32 @@ import torch
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
+def _env_int(name, default, minimum=1):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
+
+def _env_path(name, default):
+    value = os.environ.get(name)
+    return value if value else default
+
 MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
+TIME_BUDGET = _env_int("AUTORESEARCH_TIME_BUDGET_SECONDS", 300)  # training time budget in seconds
 EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
+CACHE_DIR = _env_path("AUTORESEARCH_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "autoresearch"))
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
 BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
