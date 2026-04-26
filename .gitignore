@@ -21,8 +21,19 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 artifacts/
+experiments/
 .hf-home/
+.uv-cache/
+.xdg-cache/
+.triton-cache/
+.torchinductor-cache/
+.venv-managed/
+node_modules/
 *.log
 
 # Results file
 results.tsv
+
+# Per-machine env file (the runner generates one from .env.example)
+infra/hpc_agent/.env
+infra/hpc_agent/runner/.env

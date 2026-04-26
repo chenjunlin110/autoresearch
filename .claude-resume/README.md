@@ -1,11 +1,11 @@
 # Claude Code resume bundle
 
-Files in this directory are meant to be imported into `~/.claude/` on a new
-machine so a `claude --resume <session-id>` picks up the autoresearch HPC
-agent redesign exactly where it left off.
+Files in this directory are imported into `~/.claude/` on a new machine so a
+`claude --resume <session-id>` picks up the framework v1.5 redesign exactly
+where it left off.
 
 Contents:
-- `plan.md` — the approved redesign plan (Phases 0–6)
+- `redesign-plan.md` — the approved redesign plan (Phases 0–6)
 - `session.jsonl` — the full Claude conversation transcript
 - `restore.sh` — copies both into `~/.claude/` at the right paths
 
@@ -14,13 +14,13 @@ Contents:
 ```bash
 git clone git@github.com:chenjunlin110/autoresearch.git
 cd autoresearch
-git checkout exp_0007_matrix_lr_003
+git checkout framework
 bash .claude-resume/restore.sh
 claude --resume fd6465ef-7937-4ad1-8942-08b698990432
 ```
 
 `restore.sh` writes:
-- `plan.md` → `~/.claude/plans/autoresearch-hpc-agent-kind-zephyr.md`
+- `redesign-plan.md` → `~/.claude/plans/autoresearch-hpc-agent-kind-zephyr.md`
 - `session.jsonl` → `~/.claude/projects/<hashed-cwd>/fd6465ef-7937-4ad1-8942-08b698990432.jsonl`
 
 The hashed-cwd is whatever directory you cloned into. The script auto-derives

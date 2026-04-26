@@ -17,7 +17,7 @@ project_dir="$claude_home/projects/$hashed_cwd"
 
 mkdir -p "$plans_dir" "$project_dir"
 
-cp "$script_dir/plan.md" "$plans_dir/autoresearch-hpc-agent-kind-zephyr.md"
+cp "$script_dir/redesign-plan.md" "$plans_dir/autoresearch-hpc-agent-kind-zephyr.md"
 cp "$script_dir/session.jsonl" "$project_dir/fd6465ef-7937-4ad1-8942-08b698990432.jsonl"
 
 cat <<EOF

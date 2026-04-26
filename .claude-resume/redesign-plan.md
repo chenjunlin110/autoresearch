@@ -1,8 +1,18 @@
-# Autoresearch HPC Agent — v1.5 Architecture Redesign
+# Search-Task Framework — v1.5 Architecture Redesign
 
 ## Context
 
-Today's system gets ~34% GPU duty cycle on 8×H200 over a 2h Slurm allocation: 62 successful experiments out of a theoretical 192. A reviewer audit + throughput trace confirms three real systemic problems and refutes one false alarm:
+This repo's framework is a **concurrent search-task scheduler**: an LLM manager
+proposes experiments, a worker pool runs them in parallel under a shared GPU
+allocation, results feed back into the next batch of proposals. The first
+landed task on top of it is *autoresearch* (LLM-driven hyperparameter +
+architecture search on a small GPT trainer). Future tasks slot into the same
+runtime — see [`docs/architecture.md`](../docs/architecture.md) for the
+five-piece task plugin contract. Everything below is a redesign of the
+framework runtime; nothing is autoresearch-specific even though the throughput
+audit was measured on the autoresearch task.
+
+Today's framework gets ~34% GPU duty cycle on 8×H200 over a 2h Slurm allocation: 62 successful experiments out of a theoretical 192 (measured on the autoresearch task). A reviewer audit + throughput trace confirms three real systemic problems and refutes one false alarm:
 
 | Issue | Verdict | File:line |
 |---|---|---|
