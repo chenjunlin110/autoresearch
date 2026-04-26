@@ -31,6 +31,7 @@ experiments/
 .xdg-cache/
 .triton-cache/
 .torchinductor-cache/
+.shared-cache/
 .venv-managed/
 node_modules/
 *.log

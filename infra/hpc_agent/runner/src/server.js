@@ -29,6 +29,7 @@ import {
   buildManagedWorkerTask,
   classifyParallelStepGpuFit,
   choosePrimaryActiveRun,
+  normalizeDirectExecutorConfig,
   normalizeOrchestrationConfig,
   normalizeScheduleStep,
   parseKillTasksDocument,
@@ -45,6 +46,13 @@ import { appendTaskEvent } from './task-events.js';
 import { extractOutputDirFromTaskBody, validateExperimentResult } from './result-validator.js';
 import { remainingWalltimeMs } from './slurm-walltime.js';
 import { buildCycleReport, formatCycleReportLine, writeCycleReport } from './cycle-report.js';
+import { listComputeProcesses } from './gpu-probe.js';
+import { runDirectTask } from './direct-executor.js';
+import {
+  buildExperimentLedger,
+  computeEditConfidence,
+  formatLedgerMarkdown,
+} from './experiment-ledger.js';
 import { listSessions as chatListSessions, createSession as chatCreateSession, getSession as chatGetSession, deleteSession as chatDeleteSession, updateSessionPreferences as chatUpdateSessionPreferences, streamChatMessage, getActiveStream, isStreaming as isChatStreaming, saveMessage as chatSaveMessage } from './chat.js';
 import { resolveModel, callModel, buildUserMessage, getModels as getPiModels } from './providers/index.js';
 import { buildCustomTierMap, resolveProviderRuntime } from './providers/custom-config.js';
@@ -612,6 +620,7 @@ class ProjectRunner {
         agentRuntime: normalizeAgentRuntime(config.agentRuntime || defaults.agentRuntime),
         orchestration: normalizeOrchestrationConfig(config.orchestration),
         resourceOrchestration: normalizeResourceOrchestrationConfig(config.resourceOrchestration),
+        directExecutor: normalizeDirectExecutorConfig(config.directExecutor),
       };
     } catch (e) {
       return defaults;
@@ -1786,6 +1795,37 @@ class ProjectRunner {
       '> Task-specific worker invocation (which wrapper script, which env vars) is described by the task program loaded into your skill file; do not assume a fixed wrapper path.',
       '> If the task is actually complete, emit <!-- PROJECT_COMPLETE --> with success=true.',
     ];
+
+    // Phase 5.2: compact experiment ledger from task-events. Saves the
+    // manager from `ls experiments/` + reading 50+ metrics.json files on
+    // every replan; payload stays roughly constant past N=20 experiments.
+    try {
+      const directConfig = config?.directExecutor || null;
+      const metricKey = directConfig?.metricKey || 'val_bpb';
+      const ledger = buildExperimentLedger({
+        eventsDir: this.taskEventsDir,
+        metricKey,
+      });
+      const markdown = formatLedgerMarkdown(ledger, metricKey);
+      if (markdown) {
+        lines.push('', markdown);
+      }
+      // Phase 5.3: edit-confidence addendum. When recent param_patch
+      // success drops below 70%, telegraph it loudly so the manager re-
+      // reads train.py instead of emitting the same broken edit shape.
+      const confidence = computeEditConfidence({ eventsDir: this.taskEventsDir });
+      if (confidence?.shouldWarn) {
+        const failed = confidence.total - confidence.succeeded;
+        lines.push(
+          '',
+          `> **⚠ param_patch confidence low:** ${failed}/${confidence.total} of your recent direct-executor tasks failed (rate ${(confidence.rate * 100).toFixed(0)}%). Read \`train.py\` (or the parent's train.py) to refresh \`expected_old_repr\` before emitting more edits — most failures are stale reads. Recent failures: ${confidence.recentFailureIds.join(', ')}.`,
+        );
+      }
+    } catch (e) {
+      // Ledger is a hint, not a contract; never fail the manager cycle on it.
+      try { log(`Experiment ledger build failed: ${e.message}`, this.id); } catch {}
+    }
+
     return lines.join('\n');
   }
 
@@ -2289,19 +2329,41 @@ class ProjectRunner {
         attempt: attempt + 1,
         worker: worker.name,
       });
-      lastResult = await this.runAgent(worker, config, null, task, visibility, {
-        primary: false,
-        managerName,
-        resources: step.resources || null,
-        resourceGrant: grantContext?.grant || null,
-        taskId,
-      });
+      // Outer-ring hard cap: anything still running past hardCapMs is a hung
+      // wrapper or a leaked subprocess that the inner `timeout` couldn't
+      // reach. Fire abortController on the run with this taskId; runAgent
+      // resolves with killedByTimeout, and the loop exits without retry.
+      const hardCapMs = (step.hardCapSeconds || 900) * 1000;
+      let hardCapFired = false;
+      const hardCapTimer = setTimeout(() => {
+        for (const runState of this.activeRuns.values()) {
+          if (runState.taskId !== taskId || !runState.abortController) continue;
+          hardCapFired = true;
+          log(`Hard cap fired on ${taskId} after ${Math.round(hardCapMs / 1000)}s; aborting`, this.id);
+          try { runState.abortController.abort(); } catch {}
+        }
+      }, hardCapMs);
+      try {
+        lastResult = await this.runAgent(worker, config, null, task, visibility, {
+          primary: false,
+          managerName,
+          resources: step.resources || null,
+          resourceGrant: grantContext?.grant || null,
+          taskId,
+        });
+      } finally {
+        clearTimeout(hardCapTimer);
+      }
+      if (hardCapFired) {
+        lastResult = { ...(lastResult || {}), success: false, killedByTimeout: true };
+      }
       total += 1;
       appendTaskEvent(this.taskEventsDir, taskId, 'worker_returned', {
         attempt: attempt + 1,
         success: !!lastResult?.success,
         killed_by_timeout: !!lastResult?.killedByTimeout,
         cancelled: !!lastResult?.cancelled,
+        hard_cap_fired: hardCapFired,
         duration_ms: lastResult?.durationMs ?? null,
       });
       // Phase 1 instrumentation: read canonical result from disk and log
@@ -2331,6 +2393,9 @@ class ProjectRunner {
   }
 
   async _startScheduledWorker(step, workers, config, managerName, orchestration, options = {}) {
+    if (step?.executionMode === 'param_patch') {
+      return this._startDirectExecutorTask(step, config, managerName, options);
+    }
     const workerSelection = options.worker
       ? { worker: options.worker, reason: null, wait: false }
       : findWorkerForStep(step, workers, options.busyWorkerNames || new Set());
@@ -2371,24 +2436,185 @@ class ProjectRunner {
       }
     }
 
-    const promise = this._runWorkerStepWithRetries(step, worker, config, managerName, grantContext, {
-      markAgentCompleted: options.markAgentCompleted !== false,
-      taskId: options.taskId || null,
-      isCancelled: typeof options.isCancelled === 'function' ? options.isCancelled : () => false,
-    })
-      .finally(() => {
+    const promise = (async () => {
+      let outcome = null;
+      try {
+        outcome = await this._runWorkerStepWithRetries(step, worker, config, managerName, grantContext, {
+          markAgentCompleted: options.markAgentCompleted !== false,
+          taskId: options.taskId || null,
+          isCancelled: typeof options.isCancelled === 'function' ? options.isCancelled : () => false,
+        });
+        return outcome;
+      } finally {
         if (grantContext?.grant?.id) {
+          // Killed-by-timeout means SIGTERM/SIGKILL just propagated through
+          // the bash + python tree. Pause 5s so any straggler releases its
+          // CUDA context before we hand the GPU back, then snapshot
+          // nvidia-smi for post-mortem.
+          if (outcome?.result?.killedByTimeout) {
+            await new Promise((resolve) => setTimeout(resolve, 5000));
+            try {
+              const procs = listComputeProcesses();
+              if (procs.length > 0) {
+                log(
+                  `Hard-cap drain on ${options.taskId}: nvidia-smi still reports `
+                  + `${procs.length} compute proc(s) — may include other workers`,
+                  this.id,
+                );
+              }
+            } catch {}
+          }
           this._releaseWorkerGrant(grantContext.grant.id, managerName);
           appendTaskEvent(this.taskEventsDir, options.taskId, 'released', {
             grant_id: grantContext.grant.id,
           });
         }
-      });
+      }
+    })();
 
     return {
       started: true,
       step,
       workerName: worker.name,
+      promise,
+    };
+  }
+
+  /**
+   * Dispatch a `param_patch` task without an LLM worker. Allocates a GPU
+   * grant, registers the task in `activeRuns` so KILL_TASKS / shutdown
+   * can abort it, and runs {@link runDirectTask}. The task plugin's
+   * `directExecutor:` config block names the source repo, wrapper, and
+   * sandbox/output roots; without that block we surface a blocking error
+   * so the manager learns to stop emitting param_patch.
+   *
+   * @private
+   */
+  async _startDirectExecutorTask(step, config, managerName, options = {}) {
+    const directConfig = (config?.directExecutor) || this.loadConfig().directExecutor || null;
+    if (!directConfig?.enabled) {
+      log(`Cannot run param_patch task ${step.id}: directExecutor not configured`, this.id);
+      return {
+        started: false,
+        blocked: true,
+        reason: 'directExecutor not configured for this project',
+      };
+    }
+    const taskId = options.taskId || step.id;
+
+    let grantContext = null;
+    if (this.isSingleManagerMode(config) && (step.resources?.gpus || 0) > 0) {
+      const syntheticWorker = { name: `direct:${step.id}` };
+      grantContext = this._tryGrantWorkerResources(step, syntheticWorker, managerName, config);
+      if (grantContext.blocked) {
+        appendTaskEvent(this.taskEventsDir, taskId, 'grant_blocked', { reason: grantContext.reason });
+        return { started: false, blocked: true, reason: grantContext.reason };
+      }
+      if (grantContext?.grant?.id) {
+        appendTaskEvent(this.taskEventsDir, taskId, 'granted', {
+          grant_id: grantContext.grant.id,
+          tokens: grantContext.grant.tokenNames || [],
+          worker: syntheticWorker.name,
+        });
+      }
+    }
+
+    // Token names follow the `gpu<index>` convention; map back to integer
+    // CUDA device indices for CUDA_VISIBLE_DEVICES.
+    const tokens = grantContext?.grant?.tokenNames || [];
+    const cudaDevices = tokens
+      .map((name) => Number.parseInt(String(name).replace(/^gpu/i, ''), 10))
+      .filter(Number.isInteger);
+
+    const abortController = new AbortController();
+    const runState = {
+      id: `direct-${step.id}-${Date.now()}`,
+      taskId,
+      abortController,
+      agentName: 'direct-executor',
+      isManager: false,
+      isPrimary: false,
+      startTime: Date.now(),
+      log: [],
+    };
+    this.activeRuns.set(runState.id, runState);
+    appendTaskEvent(this.taskEventsDir, taskId, 'worker_spawned', {
+      worker: 'direct-executor',
+      attempt: 1,
+    });
+
+    const outputDir = path.join(directConfig.outputRoot, step.id);
+
+    const promise = (async () => {
+      let result = null;
+      try {
+        const env = { ...directConfig.envOverrides };
+        env.AUTORESEARCH_TIME_BUDGET_SECONDS = String(directConfig.timeBudgetSeconds);
+        if (cudaDevices.length > 0) env.CUDA_VISIBLE_DEVICES = cudaDevices.join(',');
+
+        result = await runDirectTask({
+          sourceRepoPath: directConfig.sourceRepoPath,
+          sandboxParentDir: directConfig.sandboxRoot,
+          branchName: step.id,
+          parentRef: step.baseRef || 'HEAD',
+          edits: step.edits || [],
+          wrapperScript: directConfig.wrapperScript,
+          outputDir,
+          env,
+          abortSignal: abortController.signal,
+          hardCapMs: directConfig.hardCapSeconds * 1000,
+          metricKey: directConfig.metricKey,
+        });
+
+        if (!result.ok) {
+          log(
+            `Direct executor failed for ${taskId}: ${result.reason}`
+            + (result.failurePath ? ` — see ${result.failurePath}` : ''),
+            this.id,
+          );
+        }
+        appendTaskEvent(this.taskEventsDir, taskId, 'worker_returned', {
+          worker: 'direct-executor',
+          attempt: 1,
+          success: !!result.ok,
+          killed_by_timeout: !!result.timedOut,
+          cancelled: abortController.signal.aborted,
+          exit_code: result.exitCode ?? null,
+        });
+        // The direct executor IS the canonical truth source — there's no
+        // LLM stdout to disagree with — so mismatch is always false.
+        appendTaskEvent(this.taskEventsDir, taskId, 'validated', {
+          canonical_success: !!result.ok,
+          mismatch: false,
+          reason: result.reason || null,
+          ...(result.metrics
+            ? {
+                [directConfig.metricKey]: result.metrics[directConfig.metricKey],
+                training_seconds: result.metrics.training_seconds,
+              }
+            : {}),
+        });
+        return {
+          success: !!result.ok,
+          total: 1,
+          failures: result.ok ? 0 : 1,
+          result: { ...result, success: !!result.ok, killedByTimeout: !!result.timedOut },
+        };
+      } finally {
+        this.activeRuns.delete(runState.id);
+        if (grantContext?.grant?.id) {
+          this._releaseWorkerGrant(grantContext.grant.id, managerName);
+          appendTaskEvent(this.taskEventsDir, taskId, 'released', {
+            grant_id: grantContext.grant.id,
+          });
+        }
+      }
+    })();
+
+    return {
+      started: true,
+      step,
+      workerName: 'direct-executor',
       promise,
     };
   }
@@ -2486,6 +2712,31 @@ class ProjectRunner {
 
     const startLiveReplan = (completedTaskId) => {
       if (replanRequested || !orchestration.liveReplanOnTaskComplete || !managerAgent || running.length === 0) return;
+      // Watermark gate (Phase 5.1): only call the manager when the queue is
+      // shallow. With a healthy backlog, the manager doesn't need to think
+      // every time a worker returns — that just burns Opus calls. The
+      // watermark defaults to 1.5× max workers (12 on an 8-GPU node), so we
+      // don't wake the manager until the ready+running depth would force
+      // GPUs to sit idle within the next dispatch round.
+      const watermark = Math.max(
+        running.length + 1,
+        Math.ceil((orchestration.maxConcurrentWorkers || 1) * 1.5),
+      );
+      let readyCount = 0;
+      for (const candidate of plan._tasks) {
+        const state = plan._runtime.taskStates[candidate.id]?.status || 'pending';
+        if (state !== 'pending') continue;
+        const dep = this._getTaskGraphDependencyState(plan, candidate);
+        if (dep.unmetDependencies.length === 0
+            && dep.unmetTags.length === 0
+            && dep.failedDependencies.length === 0) {
+          readyCount += 1;
+        }
+      }
+      if (readyCount + running.length >= watermark) {
+        // Plenty of work queued; skip this completion's replan trigger.
+        return;
+      }
       if (liveReplans.length > 0 || plan._runtime.liveReplanInProgress) {
         // FIFO: accumulate every completion so the next replan pass sees the
         // full backlog instead of only the most recent task id.

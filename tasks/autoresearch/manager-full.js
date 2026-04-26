@@ -40,6 +40,7 @@ export function buildAutoresearchDagFullPaths({
     repoRoot,
     expOutputDir,
     resultsPath: path.join(expOutputDir, 'results.tsv'),
+    sharedCacheRoot: path.join(root, '.shared-cache'),
     experimentName,
     readmePath: path.join(repoRoot, 'README.md'),
     managerProgramPath: path.join(repoRoot, 'program.md'),
@@ -124,23 +125,75 @@ Lowest \`val_bpb\` under \`AUTORESEARCH_TIME_BUDGET_SECONDS=${timeBudgetSeconds}
 
 \`train.py\` only — everything in there is fair game (architecture, optimizer, schedule, batch shape, LR, init, attention pattern, etc.). Don't touch \`prepare.py\`, the metric, the data, or the evaluation harness.
 
-Because workers run in parallel, every non-baseline experiment must happen in its own per-experiment git repo, not in the shared root. The worker handles the cloning and committing — you just describe the edit.
+Each experiment runs in its own per-experiment git sandbox cloned from \`${workloadRoot}\`. The runner clones, applies your edit, commits, and runs train.py — you just describe what changes.
 
-## How you dispatch
+## Pick the cheapest execution_mode that fits
 
-Output \`<!-- TASK_GRAPH -->\` blocks. Each experiment is one task:
+Every task carries an \`execution_mode\`. Pick the cheapest one that can express the edit; it controls cost and reliability.
 
+- **\`"param_patch"\`** — DEFAULT. The runner applies a structured \`edits[]\` array directly (no worker LLM, no cost). Use this whenever the change is "swap one or more constants / parameters / short literal regions in train.py". This covers nearly all sweeps: depth, width, head_dim, batch shape, LR, betas, weight decay, attention window, warmup/warmdown shape. **Aim for ≥80% of your tasks to be \`param_patch\`.**
+- **\`"code_edit"\`** — falls back to an LLM worker that rewrites code in natural language. Use only when the change is genuinely free-form: architecture restructure, swap optimizer family, add/remove a layer type, rewrite the attention path. Costs an LLM call per task; reserve it.
+- **\`"llm_repair"\`** — same as \`code_edit\` but specifically for fixing a failed \`param_patch\`. The worker LLM gets the original \`failure.json\` and the parent commit's \`train.py\`. Emit one of these only when a \`param_patch\` task you care about failed because of an unparseable edit and you want the LLM to land it. Cap at one repair per failed experiment; if it fails again, move on.
+
+## How to write \`edits[]\` (param_patch)
+
+Four kinds, in order of preference:
+
+1. **\`constant_replace\`** — module-level Python assignment. Compares values via Python AST so \`524288\`, \`2**19\`, and \`1<<19\` all match.
+   \`\`\`json
+   {"file":"train.py","kind":"constant_replace","name":"ADAM_BETAS",
+    "expected_old_repr":"(0.9, 0.95)","new_repr":"(0.9, 0.97)"}
+   \`\`\`
+2. **\`regex_replace\`** — for in-line tuples, dependent string literals, or list elements. \`expected_count\` is mandatory; if your pattern doesn't match exactly that many times, the edit fails loudly instead of corrupting the file.
+   \`\`\`json
+   {"file":"train.py","kind":"regex_replace",
+    "pattern":"head_dim=128","replacement":"head_dim=64","expected_count":1}
+   \`\`\`
+3. **\`block_replace\`** — multi-line region between two anchors (inclusive of both anchor lines).
+   \`\`\`json
+   {"file":"train.py","kind":"block_replace",
+    "anchor_regex":"^# warmup schedule$","end_regex":"^# end warmup$",
+    "new_text":"# warmup schedule\\nwarmup = linear(0.01, 0.1, 100)\\n# end warmup"}
+   \`\`\`
+4. **\`unified_diff\`** — escape hatch. Pass a full \`git apply\`-compatible diff in the \`diff\` field. Use only when the other three can't express the change.
+
+Multiple edits to the same task are applied atomically; if any one fails, none take effect. Read \`train.py\` (or the parent experiment's \`train.py\`) before emitting edits — if your \`expected_old_repr\` is wrong, the task fails before training starts.
+
+## Worked TASK_GRAPH
+
+\`\`\`json
+<!-- TASK_GRAPH -->
+{"tasks":[
+  {"id":"exp_0042_betas_097","worker_class":"experiment_runner",
+   "execution_mode":"param_patch","base_ref":"HEAD",
+   "resources":{"gpus":1,"cpus":1},"priority":3,
+   "estimated_runtime_seconds":320,
+   "rationale":"Higher beta_2 may help under our larger batch.",
+   "task":"sweep adam_betas to (0.9, 0.97)",
+   "produces_tags":["metrics:exp_0042_betas_097"],
+   "edits":[
+     {"file":"train.py","kind":"constant_replace","name":"ADAM_BETAS",
+      "expected_old_repr":"(0.9, 0.95)","new_repr":"(0.9, 0.97)"}
+   ]},
+  {"id":"exp_0043_arch_swap_attn","worker_class":"experiment_runner",
+   "execution_mode":"code_edit",
+   "resources":{"gpus":1,"cpus":1},"priority":2,
+   "estimated_runtime_seconds":340,
+   "task":"In train.py, replace the existing scaled-dot-product attention with sliding-window attention of window size 128, applied uniformly across all layers. Output dir: \`${experimentName}/exp_0043_arch_swap_attn\`."}
+]}
+<!-- /TASK_GRAPH -->
+\`\`\`
+
+Common fields for both modes:
 - \`worker_class: "experiment_runner"\`
 - \`resources\`: usually \`{"gpus": 1, "cpus": 1}\`. Use larger only when the hypothesis really needs it.
-- A unique \`id\` like \`exp_0042_window_LSSS\`.
-- A unique \`produces_tags\` like \`["metrics:exp_0042_window_LSSS"]\`.
-- A task body that tells the worker:
-  - the parent (shared baseline repo, or a previously kept experiment repo)
-  - the **exact code edit**: file, constant name, old value, new value
-  - the output directory \`${experimentName}/<experiment_id>\`
-- Optional: \`agent: "maya"\` with \`worker_class: "analyst"\`, \`resources: {"gpus": 0, "cpus": N}\` for CPU-only analysis writeups.
+- Unique \`id\` like \`exp_0042_betas_097\`.
+- Unique \`produces_tags\` (lets analysts and downstream tasks depend on this experiment).
+- \`base_ref\` (param_patch only): a SHA or branch name to fork from. Default \`HEAD\`. Use a prior winning experiment's id if you want to stack edits on it.
+- \`rationale\`: one short sentence so the next replan can read why.
+- Optional: \`agent: "maya"\` with \`worker_class: "analyst"\` for CPU-only analysis writeups (no execution_mode needed; analysts always go through the LLM path).
 
-Don't include env-override-only experiments. \`train.py\` reads almost no \`AUTORESEARCH_*\` env vars; the wrapper sets the few it does.
+Don't include env-override-only experiments. \`train.py\` reads almost no \`AUTORESEARCH_*\` env vars.
 
 ## Priority and killing tasks
 
@@ -158,22 +211,32 @@ The runner will SIGTERM the worker LLM (which takes its bash + train.py descenda
 
 ## Keep/discard via git lineage
 
-After each result lands, decide: was this branch's edit a win? If yes, future experiments fork from that branch. If no, future experiments fork from the previous kept parent (skip the dead branch). Don't keep stacking edits on a discarded branch.
+After each result lands, decide: was this branch's edit a win? If yes, future experiments fork from that branch (set \`base_ref\` to its experiment id). If no, fork from the previous kept parent (skip the dead branch). Don't keep stacking edits on a discarded branch.
+
+## When tasks fail
+
+A failed \`param_patch\` task writes \`${experimentName}/<id>/failure.json\` with the structured reason — typically "expected_old_repr didn't match" (your read of train.py was stale) or "no module-level assignment to <name>" (the symbol you targeted lives inside a function). Read it before emitting more edits in the same neighborhood. If the fix is obvious (correct \`expected_old_repr\`), emit a corrected \`param_patch\` with a new id. If the change is genuinely free-form, switch to \`llm_repair\` or just \`code_edit\` for a fresh attempt.
 
 ## The loop
 
 You will be called continuously. Every time a worker finishes and returns its GPU token, the runner calls you again with the latest state. On each call:
 
-1. Read prior \`${experimentName}/**/experiment.md\`, \`metrics.json\`, \`result.txt\` to see what's been tried and what won.
+1. Read prior \`${experimentName}/**/experiment.md\`, \`metrics.json\`, \`result.txt\`, and any \`failure.json\` to see what's been tried, what won, and what failed.
 2. Decide what to try next.
 3. Append new tasks to the live TASK_GRAPH. Do not repeat existing task ids. New tasks must not depend on still-running task ids or unproduced tags.
 4. Keep around ${experimentsPerWave}-${backlogTarget} ready/pending GPU tasks queued so tokens never sit idle.
 
 Don't emit \`PROJECT_COMPLETE\`. If you run out of ideas: re-read \`${workloadRoot}/train.py\` for fresh angles, combine previous near-misses, try more radical architecture changes, or read papers referenced in the code.
 
-## First wave
+## First wave (prime the compile cache)
 
-One no-edit baseline plus a diverse portfolio across architectural axes. Don't make the first wave a pure LR sweep — that explores the smallest dimension and is what the previous run wasted hours on.
+The first \`torch.compile\` of the day costs ~150s; subsequent compiles against the shared \`AUTORESEARCH_SHARED_CACHE_ROOT\` finish in seconds. Pay that cost once, not 8× in parallel:
+
+1. Emit ONE no-edit \`param_patch\` baseline first (use a no-op edit like rewriting an unused constant to itself, or just \`code_edit\` with body "no edit; baseline run") at high priority.
+2. Make every other cycle-1 experiment \`depends_on: ["exp_0001_baseline"]\` so they don't dispatch until the baseline returns.
+3. From cycle 2 onward, full parallelism is fine — caches are warm.
+
+Beyond that warm-up rule, cycle 1 should still be a diverse portfolio across architectural axes. Don't make it a pure LR sweep — that explores the smallest dimension and is what previous runs wasted hours on.
 `;
 }
 
@@ -257,9 +320,14 @@ Rules:
 `;
 }
 
-export function renderAutoresearchDagFullConfig({ gpuCount = 8, agentRuntime = 'codex_cli' } = {}) {
+export function renderAutoresearchDagFullConfig({
+  gpuCount = 8,
+  agentRuntime = 'codex_cli',
+  directExecutor = null,
+} = {}) {
   const runtime = ['codex_cli', 'claude_cli', 'api'].includes(agentRuntime) ? agentRuntime : 'codex_cli';
   const count = Number(gpuCount) || 0;
+  const directBlock = directExecutor ? renderDirectExecutorBlock(directExecutor) : '';
   return `agentRuntime: ${runtime}
 cycleIntervalMs: 0
 orchestration:
@@ -269,7 +337,7 @@ orchestration:
   maxManagerPasses: 1000000
   refillOnGraphDrain: true
   liveReplanOnTaskComplete: true
-  liveReplanMinIntervalSeconds: 0
+  liveReplanMinIntervalSeconds: 30
   targetGpuUtilization: 1
   defaultWorkerResources:
     gpus: 0
@@ -279,7 +347,52 @@ resourceOrchestration:
   gpuCount: ${count}
   tokenPrefix: gpu
   grantRequiresLease: false
-`;
+${directBlock}`;
+}
+
+/**
+ * Render the optional `directExecutor:` block. Wires the framework's
+ * non-LLM execution path (see `infra/hpc_agent/runner/src/direct-executor.js`)
+ * to this task plugin's source repo, wrapper, and per-experiment sandbox
+ * roots so manager-emitted `param_patch` tasks can run without a worker
+ * LLM.
+ *
+ * @param {Object} cfg
+ * @param {string} cfg.sourceRepoPath  the canonical workload repo
+ * @param {string} cfg.wrapperScript   bash wrapper that runs train.py
+ * @param {string} cfg.sandboxRoot     each task clones into <sandboxRoot>/<id>
+ * @param {string} cfg.outputRoot      where the wrapper writes result.txt etc.
+ * @param {string=} cfg.resultsPath    appended to envOverrides as AUTORESEARCH_RESULTS_PATH
+ * @param {number=} cfg.timeBudgetSeconds
+ * @param {number=} cfg.hardCapSeconds
+ * @return {string}
+ */
+function renderDirectExecutorBlock({
+  sourceRepoPath,
+  wrapperScript,
+  sandboxRoot,
+  outputRoot,
+  resultsPath = null,
+  sharedCacheRoot = null,
+  timeBudgetSeconds = 300,
+  hardCapSeconds = 900,
+}) {
+  const envEntries = [];
+  if (resultsPath) envEntries.push(`    AUTORESEARCH_RESULTS_PATH: ${resultsPath}`);
+  if (sharedCacheRoot) envEntries.push(`    AUTORESEARCH_SHARED_CACHE_ROOT: ${sharedCacheRoot}`);
+  const envLines = envEntries.length
+    ? `  envOverrides:\n${envEntries.join('\n')}\n`
+    : '';
+  return `directExecutor:
+  enabled: true
+  sourceRepoPath: ${sourceRepoPath}
+  wrapperScript: ${wrapperScript}
+  sandboxRoot: ${sandboxRoot}
+  outputRoot: ${outputRoot}
+  metricKey: val_bpb
+  timeBudgetSeconds: ${timeBudgetSeconds}
+  hardCapSeconds: ${hardCapSeconds}
+${envLines}`;
 }
 
 export function renderProjectsYaml({ projectId, repoRoot, dataDir = null }) {
@@ -303,6 +416,7 @@ export function createAutoresearchDagFullWorkspace(options = {}) {
   mkdirSync(path.dirname(paths.readmePath), { recursive: true });
   mkdirSync(path.dirname(paths.experimentWorkerSkillPaths[0]), { recursive: true });
   mkdirSync(paths.expOutputDir, { recursive: true });
+  mkdirSync(paths.sharedCacheRoot, { recursive: true });
 
   writeFileSync(paths.readmePath, renderAutoresearchDagFullReadme({
     experimentName: paths.experimentName,
@@ -333,7 +447,20 @@ export function createAutoresearchDagFullWorkspace(options = {}) {
     }), 'utf8');
   }
   writeFileSync(paths.mayaSkillPath, renderAutoresearchFullAnalysisWorkerSkill(), 'utf8');
-  writeFileSync(paths.configPath, renderAutoresearchDagFullConfig({ gpuCount, agentRuntime }), 'utf8');
+  writeFileSync(paths.configPath, renderAutoresearchDagFullConfig({
+    gpuCount,
+    agentRuntime,
+    directExecutor: {
+      sourceRepoPath: toPosix(workloadRoot),
+      wrapperScript: toPosix(workerScriptPath),
+      sandboxRoot: toPosix(paths.expOutputDir),
+      outputRoot: toPosix(paths.expOutputDir),
+      resultsPath: toPosix(paths.resultsPath),
+      sharedCacheRoot: toPosix(paths.sharedCacheRoot),
+      timeBudgetSeconds,
+      hardCapSeconds: timeBudgetSeconds + 600,
+    },
+  }), 'utf8');
   writeFileSync(paths.projectsYamlPath, renderProjectsYaml({
     projectId: paths.projectId,
     repoRoot: toPosix(paths.repoRoot),

@@ -151,6 +151,76 @@ test('parseTaskGraphDocument accepts worker_class tasks without fixed agents', (
   assert.equal(graph._tasks[0].estimatedRuntimeSeconds, 30);
 });
 
+test('parseTaskGraphDocument: param_patch carries execution_mode, edits, base_ref, rationale', () => {
+  const graph = parseTaskGraphDocument(`
+<!-- TASK_GRAPH -->
+{"tasks":[
+  {"id":"exp_42","worker_class":"experiment-runner","task":"betas sweep",
+   "execution_mode":"param_patch","base_ref":"HEAD",
+   "rationale":"betas=(0.9, 0.97) likely improves convergence",
+   "edits":[
+     {"file":"train.py","kind":"constant_replace","name":"ADAM_BETAS",
+      "expected_old_repr":"(0.9, 0.95)","new_repr":"(0.9, 0.97)"}
+   ]}
+]}
+<!-- /TASK_GRAPH -->
+  `);
+  assert.ok(graph);
+  const task = graph._tasks[0];
+  assert.equal(task.executionMode, 'param_patch');
+  assert.equal(task.baseRef, 'HEAD');
+  assert.equal(task.rationale, 'betas=(0.9, 0.97) likely improves convergence');
+  assert.equal(task.edits.length, 1);
+  assert.equal(task.edits[0].kind, 'constant_replace');
+});
+
+test('parseTaskGraphDocument: defaults execution_mode to code_edit and leaves edits null', () => {
+  const graph = parseTaskGraphDocument(`
+<!-- TASK_GRAPH -->
+{"tasks":[{"id":"exp_a","agent":"alice","task":"do thing"}]}
+<!-- /TASK_GRAPH -->
+  `);
+  assert.ok(graph);
+  assert.equal(graph._tasks[0].executionMode, 'code_edit');
+  assert.equal(graph._tasks[0].edits, null);
+});
+
+test('parseTaskGraphDocument: rejects param_patch without edits', () => {
+  const errors = [];
+  const graph = parseTaskGraphDocument(`
+<!-- TASK_GRAPH -->
+{"tasks":[{"id":"exp_a","agent":"alice","task":"x","execution_mode":"param_patch"}]}
+<!-- /TASK_GRAPH -->
+  `, undefined, { errors });
+  assert.equal(graph, null);
+  assert.ok(errors.some((e) => /requires non-empty "edits"/.test(e)),
+    `expected edits-required error, got: ${errors.join(' | ')}`);
+});
+
+test('parseTaskGraphDocument: rejects malformed edit kinds', () => {
+  const errors = [];
+  const graph = parseTaskGraphDocument(`
+<!-- TASK_GRAPH -->
+{"tasks":[{"id":"exp_a","agent":"alice","task":"x","execution_mode":"param_patch",
+  "edits":[{"file":"train.py","kind":"regex_replace","pattern":"foo","replacement":"bar"}]}]}
+<!-- /TASK_GRAPH -->
+  `, undefined, { errors });
+  assert.equal(graph, null);
+  assert.ok(errors.some((e) => /expected_count/.test(e)),
+    `expected count error, got: ${errors.join(' | ')}`);
+});
+
+test('parseTaskGraphDocument: rejects unknown execution_mode', () => {
+  const errors = [];
+  const graph = parseTaskGraphDocument(`
+<!-- TASK_GRAPH -->
+{"tasks":[{"id":"x","agent":"a","task":"y","execution_mode":"yolo"}]}
+<!-- /TASK_GRAPH -->
+  `, undefined, { errors });
+  assert.equal(graph, null);
+  assert.ok(errors.some((e) => /invalid execution_mode/.test(e)));
+});
+
 test('parseTaskGraphDocument can depend on existing live graph task ids', () => {
   const graph = parseTaskGraphDocument(`
 <!-- TASK_GRAPH -->

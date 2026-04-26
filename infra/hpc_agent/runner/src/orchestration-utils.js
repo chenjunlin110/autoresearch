@@ -58,6 +58,65 @@ function normalizeVisibility(value) {
   return 'full';
 }
 
+const VALID_EXECUTION_MODES = new Set(['code_edit', 'param_patch', 'llm_repair']);
+
+function normalizeExecutionMode(value) {
+  if (value === undefined || value === null) return 'code_edit';
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  return VALID_EXECUTION_MODES.has(normalized) ? normalized : null;
+}
+
+const VALID_EDIT_KINDS = new Set([
+  'constant_replace',
+  'regex_replace',
+  'block_replace',
+  'unified_diff',
+]);
+
+/**
+ * Validate `edits[]` shape per kind. Returns `null` if valid, or a short
+ * human-readable reason. Each kind's required fields must be present;
+ * extras are ignored. Schema validation runs at parse time so a malformed
+ * edit fails the whole TASK_GRAPH (cheap to fix; expensive in flight).
+ *
+ * @param {unknown} edits
+ * @return {string|null}
+ */
+function validateEdits(edits) {
+  if (!Array.isArray(edits)) return 'edits must be an array';
+  for (let i = 0; i < edits.length; i += 1) {
+    const edit = edits[i];
+    if (!edit || typeof edit !== 'object' || Array.isArray(edit)) {
+      return `edits[${i}] is not an object`;
+    }
+    if (typeof edit.file !== 'string' || !edit.file.trim()) {
+      return `edits[${i}] missing "file"`;
+    }
+    if (!VALID_EDIT_KINDS.has(edit.kind)) {
+      return `edits[${i}].kind "${edit.kind}" is not one of ${[...VALID_EDIT_KINDS].join(', ')}`;
+    }
+    if (edit.kind === 'constant_replace') {
+      if (typeof edit.name !== 'string' || !edit.name.trim()) return `edits[${i}] constant_replace missing "name"`;
+      if (typeof edit.expected_old_repr !== 'string') return `edits[${i}] constant_replace missing "expected_old_repr"`;
+      if (typeof edit.new_repr !== 'string') return `edits[${i}] constant_replace missing "new_repr"`;
+    } else if (edit.kind === 'regex_replace') {
+      if (typeof edit.pattern !== 'string') return `edits[${i}] regex_replace missing "pattern"`;
+      if (typeof edit.replacement !== 'string') return `edits[${i}] regex_replace missing "replacement"`;
+      if (!Number.isInteger(edit.expected_count) || edit.expected_count < 1) {
+        return `edits[${i}] regex_replace missing positive integer "expected_count"`;
+      }
+    } else if (edit.kind === 'block_replace') {
+      if (typeof edit.anchor_regex !== 'string') return `edits[${i}] block_replace missing "anchor_regex"`;
+      if (typeof edit.end_regex !== 'string') return `edits[${i}] block_replace missing "end_regex"`;
+      if (typeof edit.new_text !== 'string') return `edits[${i}] block_replace missing "new_text"`;
+    } else if (edit.kind === 'unified_diff') {
+      if (typeof edit.diff !== 'string' || !edit.diff.trim()) return `edits[${i}] unified_diff missing "diff"`;
+    }
+  }
+  return null;
+}
+
 function normalizeStringList(value) {
   if (Array.isArray(value)) {
     return [...new Set(value
@@ -107,6 +166,47 @@ function parseAgentStep(step) {
     visibility: value.visibility,
     resources: value.resources,
     retries: value.retries,
+  };
+}
+
+/**
+ * Normalize the optional `directExecutor:` block in `config.yaml`. When
+ * a task plugin enables it, the framework dispatches `param_patch` tasks
+ * to {@link runDirectTask} instead of an LLM worker.
+ *
+ * Returns `null` when the plugin opted out (`enabled: false` or block
+ * missing); callers that see a `param_patch` task without config should
+ * surface a clear "directExecutor not configured" error.
+ *
+ * @param {unknown} input
+ * @return {Object|null}
+ */
+export function normalizeDirectExecutorConfig(input) {
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : null;
+  if (!source) return null;
+  if (source.enabled === false) return null;
+  const required = ['sourceRepoPath', 'wrapperScript', 'sandboxRoot', 'outputRoot'];
+  for (const key of required) {
+    if (typeof source[key] !== 'string' || !source[key].trim()) return null;
+  }
+  const env = source.envOverrides && typeof source.envOverrides === 'object' && !Array.isArray(source.envOverrides)
+    ? Object.fromEntries(
+        Object.entries(source.envOverrides)
+          .filter(([, value]) => typeof value === 'string' || typeof value === 'number')
+          .map(([key, value]) => [key, String(value)]),
+      )
+    : {};
+  return {
+    enabled: true,
+    sourceRepoPath: source.sourceRepoPath.trim(),
+    wrapperScript: source.wrapperScript.trim(),
+    sandboxRoot: source.sandboxRoot.trim(),
+    outputRoot: source.outputRoot.trim(),
+    metricKey: typeof source.metricKey === 'string' && source.metricKey.trim()
+      ? source.metricKey.trim() : 'val_bpb',
+    timeBudgetSeconds: coercePositiveInteger(source.timeBudgetSeconds, 300),
+    hardCapSeconds: coercePositiveInteger(source.hardCapSeconds, 900),
+    envOverrides: env,
   };
 }
 
@@ -250,12 +350,39 @@ export function parseTaskGraphDocument(resultText, defaultWorkerResources = DEFA
       }
       tagProducers.set(tag, id);
     }
+    const executionMode = normalizeExecutionMode(task.execution_mode ?? task.executionMode);
+    if (executionMode === null) {
+      pushError(`${pos} (${id}): invalid execution_mode (must be code_edit, param_patch, or llm_repair)`);
+      return null;
+    }
+    let edits = null;
+    const editsProvided = task.edits !== undefined && task.edits !== null;
+    if (executionMode === 'param_patch' && (!editsProvided || (Array.isArray(task.edits) && task.edits.length === 0))) {
+      pushError(`${pos} (${id}): execution_mode=param_patch requires non-empty "edits"`);
+      return null;
+    }
+    if (editsProvided) {
+      const editError = validateEdits(task.edits);
+      if (editError) {
+        pushError(`${pos} (${id}): ${editError}`);
+        return null;
+      }
+      edits = task.edits;
+    }
+    const baseRef = typeof (task.base_ref ?? task.baseRef) === 'string'
+      && (task.base_ref ?? task.baseRef).trim()
+      ? (task.base_ref ?? task.baseRef).trim()
+      : null;
     return {
       id,
       type: 'agent',
       agent,
       workerClass,
       task: work,
+      executionMode,
+      edits,
+      baseRef,
+      rationale: typeof task.rationale === 'string' ? task.rationale.trim() : null,
       visibility: normalizeVisibility(task.visibility),
       resources: normalizeWorkerResources(task.resources, defaultWorkerResources),
       retries: coerceNonNegativeInteger(task.retries, 2),

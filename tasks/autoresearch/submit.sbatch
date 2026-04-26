@@ -52,6 +52,13 @@ mkdir -p "$run_root"
 export TBC_HOME="$run_root/tbc_home"
 mkdir -p "$TBC_HOME/logs"
 
+# Shared compile cache root. Both the direct executor and any LLM-driven
+# bash worker that sources tasks/autoresearch/worker.sh will point all of
+# their inductor/triton/uv/hf/xdg caches under here, so the first cold
+# torch.compile pays for itself across every later worker on this node.
+export AUTORESEARCH_SHARED_CACHE_ROOT="$run_root/.shared-cache"
+mkdir -p "$AUTORESEARCH_SHARED_CACHE_ROOT"
+
 {
   echo "timestamp=$timestamp"
   echo "hostname=$(hostname)"
