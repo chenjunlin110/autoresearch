@@ -52,12 +52,15 @@ mkdir -p "$run_root"
 export TBC_HOME="$run_root/tbc_home"
 mkdir -p "$TBC_HOME/logs"
 
-# Shared compile cache root. Both the direct executor and any LLM-driven
-# bash worker that sources tasks/autoresearch/worker.sh will point all of
-# their inductor/triton/uv/hf/xdg caches under here, so the first cold
-# torch.compile pays for itself across every later worker on this node.
-export AUTORESEARCH_SHARED_CACHE_ROOT="$run_root/.shared-cache"
+# Shared compile cache root. Persisted in $HOME (not the per-run dir) so
+# cycle 1 of run N reuses the inductor/triton kernels compiled by run
+# N-1. Inductor's internal hashing handles dedup across structurally-
+# different code, and torch.compile's correctness checks make stale-key
+# misses safe (it falls back to fresh compile). Without persistence,
+# every fresh sbatch pays 150s × 8 of cold compile up front.
+export AUTORESEARCH_SHARED_CACHE_ROOT="${AUTORESEARCH_SHARED_CACHE_ROOT:-$HOME/.cache/autoresearch-shared-cache}"
 mkdir -p "$AUTORESEARCH_SHARED_CACHE_ROOT"
+echo "shared_cache=$AUTORESEARCH_SHARED_CACHE_ROOT" >> "$run_root/job.env"
 
 {
   echo "timestamp=$timestamp"

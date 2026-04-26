@@ -40,7 +40,12 @@ export function buildAutoresearchDagFullPaths({
     repoRoot,
     expOutputDir,
     resultsPath: path.join(expOutputDir, 'results.tsv'),
-    sharedCacheRoot: path.join(root, '.shared-cache'),
+    // Persist the compile cache outside the per-run dir so cycle-1 of
+    // a fresh sbatch reuses kernels compiled by prior runs. Honour the
+    // sbatch's AUTORESEARCH_SHARED_CACHE_ROOT env if set so both paths
+    // point at the same dir.
+    sharedCacheRoot: process.env.AUTORESEARCH_SHARED_CACHE_ROOT
+      || path.join(process.env.HOME || root, '.cache', 'autoresearch-shared-cache'),
     experimentName,
     readmePath: path.join(repoRoot, 'README.md'),
     managerProgramPath: path.join(repoRoot, 'program.md'),
@@ -189,7 +194,7 @@ Common fields for both modes:
 - \`resources\`: usually \`{"gpus": 1, "cpus": 1}\`. Use larger only when the hypothesis really needs it.
 - Unique \`id\` like \`exp_0042_betas_097\`.
 - Unique \`produces_tags\` (lets analysts and downstream tasks depend on this experiment).
-- \`base_ref\` (param_patch only): a SHA or branch name to fork from. Default \`HEAD\`. Use a prior winning experiment's id if you want to stack edits on it.
+- \`base_ref\` (param_patch only): a ref in the **shared baseline source repo only** — almost always just leave it as \`HEAD\` (the default). Per-experiment sandboxes are isolated clones, so a child experiment cannot fork from another experiment's id at the git level. To "stack" edits on a prior winning experiment, either include the prior winner's edits + your new edit in a single \`edits[]\` array (multiple edits are applied atomically), or just emit a fresh \`code_edit\` task that describes the cumulative change.
 - \`rationale\`: one short sentence so the next replan can read why.
 - Optional: \`agent: "maya"\` with \`worker_class: "analyst"\` for CPU-only analysis writeups (no execution_mode needed; analysts always go through the LLM path).
 
@@ -228,15 +233,11 @@ You will be called continuously. Every time a worker finishes and returns its GP
 
 Don't emit \`PROJECT_COMPLETE\`. If you run out of ideas: re-read \`${workloadRoot}/train.py\` for fresh angles, combine previous near-misses, try more radical architecture changes, or read papers referenced in the code.
 
-## First wave (prime the compile cache)
+## First wave
 
-The first \`torch.compile\` of the day costs ~150s; subsequent compiles against the shared \`AUTORESEARCH_SHARED_CACHE_ROOT\` finish in seconds. Pay that cost once, not 8× in parallel:
+\`AUTORESEARCH_SHARED_CACHE_ROOT\` persists across sbatch runs, so the first wave usually hits a warm \`torch.compile\` cache from prior days. Even on a fresh cache (first run on a new node), 8 workers compiling in parallel only costs ~200s of wall time, not 8× — so just dispatch \${experimentsPerWave} tasks in parallel from t=0.
 
-1. Emit ONE no-edit \`param_patch\` baseline first (use a no-op edit like rewriting an unused constant to itself, or just \`code_edit\` with body "no edit; baseline run") at high priority.
-2. Make every other cycle-1 experiment \`depends_on: ["exp_0001_baseline"]\` so they don't dispatch until the baseline returns.
-3. From cycle 2 onward, full parallelism is fine — caches are warm.
-
-Beyond that warm-up rule, cycle 1 should still be a diverse portfolio across architectural axes. Don't make it a pure LR sweep — that explores the smallest dimension and is what previous runs wasted hours on.
+Cycle 1 should be a diverse portfolio across architectural axes — depth, width, head_dim, attention pattern, optimizer, schedule shape. Don't make it a pure LR sweep — that explores the smallest dimension and is what previous runs wasted hours on. Include one no-edit \`param_patch\` baseline (e.g. rewrite an unused constant to itself) so you have a regression line.
 `;
 }
 
