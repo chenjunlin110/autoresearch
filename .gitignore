@@ -34,6 +34,9 @@ experiments/
 .venv-managed/
 node_modules/
 *.log
+# Slurm sbatch stdout/stderr (written next to submit dir as %x-%j.out/.err)
+*.out
+*.err
 
 # Results file
 results.tsv

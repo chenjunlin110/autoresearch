@@ -8,6 +8,8 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --gpus=8
 #SBATCH --time=08:00:00
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
 
 # Launch the autoresearch task (manager + 8 experiment workers) directly on
 # a GPU compute node. The framework server runs in the foreground so the
@@ -22,10 +24,23 @@
 
 set -euo pipefail
 
-# script_dir = <repo>/tasks/autoresearch
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/../.." && pwd)"
+# Slurm copies the script into a spool dir before executing, so BASH_SOURCE
+# points at /var/spool/slurm/<job>/slurm_script — useless for resolving the
+# repo. Use SLURM_SUBMIT_DIR (the directory sbatch was invoked from) when
+# available; outside Slurm fall back to BASH_SOURCE for ad-hoc runs.
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  repo_root="$SLURM_SUBMIT_DIR"
+else
+  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fi
+script_dir="$repo_root/tasks/autoresearch"
 runner_root="$repo_root/infra/hpc_agent/runner"
+
+if [[ ! -f "$script_dir/create-full.js" ]]; then
+  echo "submit.sbatch: cannot find $script_dir/create-full.js — repo_root=$repo_root may be wrong." >&2
+  exit 1
+fi
+
 cd "$repo_root"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
