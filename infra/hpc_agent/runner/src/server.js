@@ -3132,14 +3132,10 @@ class ProjectRunner {
           sharedRules += dbContent + '\n\n---\n\n';
         } catch {}
       }
-      if (agent.name !== 'themis') {
-        if (visMode === 'focused') {
-          sharedRules += '\n> **You are in focused mode.** You cannot read the issue tracker or PR board. Work only from the task, the repository, shared knowledge, and your own agent notes. If needed, you may create a new issue or PR record to report a blocker or finding.\n\n---\n\n';
-        } else if (visMode === 'blind') {
-          sharedRules += '\n> **You are in blind mode.** You cannot read the issue tracker or PR board, and you cannot rely on shared knowledge or any agent notes, including your own prior notes. Work only from the task and the repository. If needed, you may create a new issue or PR record to report a blocker or finding.\n\n---\n\n';
-        }
-      } else {
-        sharedRules += '\n> **You are Themis, final examination manager.** You run in full view, not blind. Inspect the repository, issue tracker, PR board, shared knowledge, and agent notes directly. You may hire and schedule workers, but only workers who report to you. Your examination team is independent from the Athena, Ares, and Apollo teams, so make your own judgment from primary evidence.\n\n---\n\n';
+      if (visMode === 'focused') {
+        sharedRules += '\n> **You are in focused mode.** You cannot read the issue tracker or PR board. Work only from the task, the repository, shared knowledge, and your own agent notes. If needed, you may create a new issue or PR record to report a blocker or finding.\n\n---\n\n';
+      } else if (visMode === 'blind') {
+        sharedRules += '\n> **You are in blind mode.** You cannot read the issue tracker or PR board, and you cannot rely on shared knowledge or any agent notes, including your own prior notes. Work only from the task and the repository. If needed, you may create a new issue or PR record to report a blocker or finding.\n\n---\n\n';
       }
       const rolePath = path.join(ROOT, 'agent', agent.isManager ? 'manager.md' : 'worker.md');
       sharedRules += fs.readFileSync(rolePath, 'utf-8') + '\n\n---\n\n';
@@ -5034,7 +5030,7 @@ const server = http.createServer(async (req, res) => {
             if (!allowed.has(actingAs)) {
               const error = special === 'chat-human'
                 ? `Issue #${issueId} was opened by ${issue.creator} and can only be closed by chat or human`
-                : `Issue #${issueId} was opened by ${issue.creator} and can only be closed by ${issue.creator} or athena`;
+                : `Issue #${issueId} was opened by ${issue.creator} and can only be closed by the same creator`;
               res.writeHead(403, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ error }));
               return;
