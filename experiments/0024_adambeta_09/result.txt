@@ -1,0 +1,3 @@
+exit_code=0
+output_dir=/mnt/weka/home/junlin.chen/workspace/autoresearch/experiments/0024_adambeta_09
+metrics_path=/mnt/weka/home/junlin.chen/workspace/autoresearch/experiments/0024_adambeta_09/metrics.json

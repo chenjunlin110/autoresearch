@@ -19,6 +19,11 @@ mkdir -p "$output_dir"
 : "${TORCHINDUCTOR_CACHE_DIR:=$repo_root/.torchinductor-cache}"
 : "${AUTORESEARCH_METRICS_PATH:=$output_dir/metrics.json}"
 : "${OMP_NUM_THREADS:=1}"
+# Default compile=on to match the official autoresearch baseline. A worker
+# may still pass AUTORESEARCH_DISABLE_COMPILE=1 explicitly to opt out (e.g.
+# retrying after a torch.compile error).
+: "${AUTORESEARCH_DISABLE_COMPILE:=0}"
+export AUTORESEARCH_DISABLE_COMPILE
 
 export UV_CACHE_DIR
 export HF_HOME

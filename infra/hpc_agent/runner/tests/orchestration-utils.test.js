@@ -7,6 +7,7 @@ import {
   computeTaskGraphCriticalPathScores,
   normalizeOrchestrationConfig,
   normalizeScheduleStep,
+  parseKillTasksDocument,
   parseScheduleDocument,
   parseTaskGraphDocument,
   selectBackfillParallelStepIndex,
@@ -262,4 +263,20 @@ test('buildManagedWorkerTask prepends grant instructions', () => {
   assert.match(task, /do not use srun, HpcSubmit, or any cross-node attach/);
   assert.match(task, /use that exact directory/);
   assert.match(task, /Run the training job/);
+});
+
+test('parseKillTasksDocument extracts ids and is forgiving', () => {
+  assert.deepEqual(
+    parseKillTasksDocument('chatter <!-- KILL_TASKS --> ["exp_0042", "exp_0099"] <!-- /KILL_TASKS --> more chatter'),
+    ['exp_0042', 'exp_0099'],
+  );
+  // dedup + trim
+  assert.deepEqual(
+    parseKillTasksDocument('<!-- KILL_TASKS -->[" exp_a ","exp_a"]<!-- /KILL_TASKS -->'),
+    ['exp_a'],
+  );
+  // missing block, malformed JSON, non-string entries → []
+  assert.deepEqual(parseKillTasksDocument('no block here'), []);
+  assert.deepEqual(parseKillTasksDocument('<!-- KILL_TASKS -->[oops<!-- /KILL_TASKS -->'), []);
+  assert.deepEqual(parseKillTasksDocument('<!-- KILL_TASKS -->[1,2,3]<!-- /KILL_TASKS -->'), []);
 });

@@ -174,6 +174,25 @@ export function normalizeScheduleStep(step, defaultWorkerResources = DEFAULT_WOR
   };
 }
 
+// Manager may emit `<!-- KILL_TASKS --> [...] <!-- /KILL_TASKS -->` alongside
+// (or instead of) a TASK_GRAPH to abort tasks whose results are no longer
+// worth the GPU time. Returns a deduplicated array of task ids, or [] when
+// the block is absent or malformed.
+export function parseKillTasksDocument(resultText) {
+  const match = String(resultText || '').match(/<!--\s*KILL_TASKS\s*-->\s*(\[[\s\S]*?\])\s*<!--\s*\/KILL_TASKS\s*-->/);
+  if (!match) return [];
+  let raw;
+  try { raw = JSON.parse(match[1]); } catch { return []; }
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  for (const item of raw) {
+    if (typeof item !== 'string') continue;
+    const id = item.trim();
+    if (id) seen.add(id);
+  }
+  return [...seen];
+}
+
 export function parseScheduleDocument(resultText, defaultWorkerResources = DEFAULT_WORKER_RESOURCES) {
   const match = String(resultText || '').match(/<!--\s*SCHEDULE\s*-->\s*([\[{][\s\S]*?[\]}])\s*<!--\s*\/SCHEDULE\s*-->/);
   if (!match) return null;

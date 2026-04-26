@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
 import yaml from 'js-yaml';
 import Database from 'better-sqlite3';
-import { runAgentWithAPI, runAgentWithCodexCLI } from './agent-runner.js';
+import { runAgentWithAPI, runAgentWithClaudeCLI, runAgentWithCodexCLI } from './agent-runner.js';
 import {
   buildEmptyResourceSummary,
   createTokenRequest,
@@ -31,6 +31,7 @@ import {
   choosePrimaryActiveRun,
   normalizeOrchestrationConfig,
   normalizeScheduleStep,
+  parseKillTasksDocument,
   parseScheduleDocument,
   parseTaskGraphDocument,
   selectBackfillParallelStepIndex,
@@ -40,6 +41,10 @@ import {
   inferWorkerClassFromMetadata,
   selectTaskGraphRunnableTask,
 } from './scheduler.js';
+import { appendTaskEvent } from './task-events.js';
+import { extractOutputDirFromTaskBody, validateExperimentResult } from './result-validator.js';
+import { remainingWalltimeMs } from './slurm-walltime.js';
+import { buildCycleReport, formatCycleReportLine, writeCycleReport } from './cycle-report.js';
 import { listSessions as chatListSessions, createSession as chatCreateSession, getSession as chatGetSession, deleteSession as chatDeleteSession, updateSessionPreferences as chatUpdateSessionPreferences, streamChatMessage, getActiveStream, isStreaming as isChatStreaming, saveMessage as chatSaveMessage } from './chat.js';
 import { resolveModel, callModel, buildUserMessage, getModels as getPiModels } from './providers/index.js';
 import { buildCustomTierMap, resolveProviderRuntime } from './providers/custom-config.js';
@@ -99,8 +104,8 @@ function parseSummarizeCooldown(message) {
 function normalizeAgentRuntime(value) {
   const runtime = String(value || '').trim().toLowerCase();
   if (runtime === 'api') return 'api';
-  if (runtime === 'codex-cli') return 'codex_cli';
-  if (runtime === 'codex_cli') return 'codex_cli';
+  if (runtime === 'codex-cli' || runtime === 'codex_cli' || runtime === 'codex') return 'codex_cli';
+  if (runtime === 'claude-cli' || runtime === 'claude_cli' || runtime === 'claude' || runtime === 'claude-code' || runtime === 'claude_code') return 'claude_cli';
   return 'codex_cli';
 }
 
@@ -421,6 +426,13 @@ class ProjectRunner {
   constructor(id, config) {
     this.id = id;
     this.path = config.path.replace(/^~/, process.env.HOME);
+    // Optional explicit data dir from projects.yaml. Takes precedence over the
+    // git-remote-derived path so workspace generators can pin the runner's
+    // reads to the same directory they wrote (config.yaml, skills, state.json,
+    // project.db all live there).
+    this.explicitDataDir = typeof config.dataDir === 'string' && config.dataDir.trim()
+      ? config.dataDir.replace(/^~/, process.env.HOME)
+      : null;
     this.enabled = config.enabled !== false;
     this.archived = config.archived === true;
     this.cycleCount = 0;   // Cycles: manager + worker runs
@@ -477,6 +489,7 @@ class ProjectRunner {
   }
 
   get projectDir() {
+    if (this.explicitDataDir) return this.explicitDataDir;
     const repo = this.repo;
     if (repo) {
       return path.join(TBC_HOME, 'dev', 'src', 'github.com', ...repo.split('/'));
@@ -514,6 +527,10 @@ class ProjectRunner {
 
   get statePath() {
     return path.join(this.projectDir, 'state.json');
+  }
+
+  get taskEventsDir() {
+    return path.join(this.projectDir, 'task-events');
   }
 
   get stopPath() {
@@ -621,7 +638,7 @@ class ProjectRunner {
     return this.getOrchestrationConfig(config).mode === 'single_manager';
   }
 
-  _createRunState(agent, { mode = null, task = null, visibility = null, primary = false, managerName = null, resources = null, resourceGrant = null } = {}) {
+  _createRunState(agent, { mode = null, task = null, visibility = null, primary = false, managerName = null, resources = null, resourceGrant = null, taskId = null } = {}) {
     const runState = {
       id: `run-${this.nextRunId++}`,
       agentName: agent.name,
@@ -640,6 +657,7 @@ class ProjectRunner {
       usage: null,
       keyId: null,
       abortController: null,
+      taskId,
     };
     this.activeRuns.set(runState.id, runState);
     this._syncCurrentAgentSnapshot();
@@ -1779,7 +1797,8 @@ class ProjectRunner {
     try {
       db = this.getDb();
       const lease = getAllocationLease(db);
-      if (!lease) {
+      const leaseRequired = config?.resourceOrchestration?.grantRequiresLease !== false;
+      if (leaseRequired && !lease) {
         return { blocked: true, reason: 'no active allocation lease' };
       }
       const available = listResourceTokens(db)
@@ -1837,8 +1856,13 @@ class ProjectRunner {
       const lease = getAllocationLease(db);
       const tokens = listResourceTokens(db);
       const availableGpuTokens = tokens.filter((token) => token.available).length;
+      // grantRequiresLease=false means the runner is already inside the GPU
+      // allocation (sbatch on a compute node) and no lease row gets written.
+      // Treat that as having effective allocation so admission doesn't block.
+      const resourceConfig = this.loadConfig().resourceOrchestration || {};
+      const leaseRequired = resourceConfig.grantRequiresLease !== false;
       return {
-        hasAllocationLease: !!lease,
+        hasAllocationLease: leaseRequired ? !!lease : true,
         totalGpuTokens: tokens.length,
         availableGpuTokens,
       };
@@ -1857,6 +1881,47 @@ class ProjectRunner {
     return !!plan && plan._kind === 'task_graph' && Array.isArray(plan._tasks);
   }
 
+  // Mark a set of task ids as cancelled, abort any active worker LLM runs for
+  // those tasks, and let the existing finally branch release their GPU grants.
+  // Manager invokes this via a `<!-- KILL_TASKS -->` block.
+  _killTaskGraphTasks(plan, ids) {
+    if (!this._isTaskGraphPlan(plan) || !Array.isArray(ids) || ids.length === 0) return 0;
+    this._ensureTaskGraphRuntime(plan);
+    const runtime = plan._runtime;
+    if (!(runtime.cancelledTaskIds instanceof Set)) {
+      runtime.cancelledTaskIds = new Set(Array.isArray(runtime.cancelledTaskIds) ? runtime.cancelledTaskIds : []);
+    }
+    let killed = 0;
+    const knownIds = new Set(plan._tasks.map((task) => task.id));
+    for (const id of ids) {
+      if (!knownIds.has(id)) {
+        log(`Manager kill ignored: unknown task id "${id}"`, this.id);
+        continue;
+      }
+      const state = runtime.taskStates[id];
+      if (!state || ['completed', 'failed', 'blocked', 'cancelled'].includes(state.status)) continue;
+      runtime.cancelledTaskIds.add(id);
+      runtime.taskStates[id] = {
+        ...state,
+        status: 'cancelled',
+        finishedAt: new Date().toISOString(),
+        reason: 'killed by manager',
+      };
+      // Abort any active worker LLM run tagged with this task id. The LLM CLI
+      // is spawned with a process group and SIGTERM'd via abortController, so
+      // the worker's bash + train.py descendants are also taken down.
+      for (const runState of this.activeRuns.values()) {
+        if (runState.taskId === id && runState.abortController) {
+          try { runState.abortController.abort(); } catch {}
+        }
+      }
+      log(`Manager killed task ${id}`, this.id);
+      killed += 1;
+    }
+    if (killed) this.saveState();
+    return killed;
+  }
+
   _ensureTaskGraphRuntime(plan) {
     if (!this._isTaskGraphPlan(plan)) return;
     if (!plan._runtime || typeof plan._runtime !== 'object' || Array.isArray(plan._runtime)) {
@@ -1873,6 +1938,11 @@ class ProjectRunner {
     }
     if (!Object.prototype.hasOwnProperty.call(plan._runtime, 'replanTaskId')) {
       plan._runtime.replanTaskId = null;
+    }
+    if (!(plan._runtime.cancelledTaskIds instanceof Set)) {
+      plan._runtime.cancelledTaskIds = new Set(
+        Array.isArray(plan._runtime.cancelledTaskIds) ? plan._runtime.cancelledTaskIds : [],
+      );
     }
 
     for (const task of plan._tasks) {
@@ -2129,7 +2199,11 @@ class ProjectRunner {
         availableGpuTokens: availability.availableGpuTokens,
       });
       const result = await this.runAgent(managerAgent, config, 'single-manager-live-replan', context, { mode: 'full', issues: [] });
-      if (!result?.success || !result?.resultText) return { added: 0, skipped: 0, ran: true };
+      if (!result?.success || !result?.resultText) return { added: 0, skipped: 0, killed: 0, ran: true };
+      // Apply kill requests first so any newly-appended task that depends on
+      // a killed task's tag will be rejected by the merge step.
+      const killIds = parseKillTasksDocument(result.resultText);
+      const killed = killIds.length ? this._killTaskGraphTasks(plan, killIds) : 0;
       const incoming = this.parseSchedule(result.resultText, {
         additionalKnownTaskIds: plan._tasks.map((task) => task.id),
       });
@@ -2137,7 +2211,7 @@ class ProjectRunner {
         if (String(result.resultText || '').includes('<!-- PROJECT_COMPLETE -->')) {
           log('Ignoring live PROJECT_COMPLETE while task graph still has running workers', this.id);
         }
-        return { added: 0, skipped: 0, ran: true };
+        return { added: 0, skipped: 0, killed, ran: true };
       }
       const merged = this._mergeTaskGraphIntoCurrentPlan(plan, incoming);
       if (merged.added > 0) {
@@ -2152,7 +2226,47 @@ class ProjectRunner {
     }
   }
 
-  async _runWorkerStepWithRetries(step, worker, config, managerName, grantContext = null, { markAgentCompleted = true } = {}) {
+  // Phase 1 instrumentation: parse canonical result.txt + metrics.json from
+  // the experiment output dir (best-effort extracted from the task body) and
+  // record a `validated` event capturing the canonical truth alongside the
+  // LLM's stdout-driven success claim. Until Phase 3 flips the source of
+  // truth, mismatches are logged but not enforced — this lets us measure
+  // the disagreement rate on real workloads first.
+  _recordCanonicalValidation(taskId, step, lastResult) {
+    try {
+      if (!taskId) return;
+      const outputDir = extractOutputDirFromTaskBody(step?.task);
+      if (!outputDir) {
+        appendTaskEvent(this.taskEventsDir, taskId, 'validate_skipped', {
+          reason: 'no_output_dir_in_task_body',
+        });
+        return;
+      }
+      const resolvedDir = path.isAbsolute(outputDir) ? outputDir : path.join(this.path, outputDir);
+      const verdict = validateExperimentResult({ outputDir: resolvedDir });
+      const llmClaim = !!lastResult?.success;
+      const mismatch = llmClaim !== verdict.success;
+      appendTaskEvent(this.taskEventsDir, taskId, 'validated', {
+        canonical_success: verdict.success,
+        canonical_reason: verdict.reason || null,
+        exit_code: verdict.exitCode ?? null,
+        val_bpb: verdict.metrics?.val_bpb ?? null,
+        training_seconds: verdict.metrics?.training_seconds ?? null,
+        num_steps: verdict.metrics?.num_steps ?? null,
+        llm_claim_success: llmClaim,
+        mismatch,
+        output_dir: resolvedDir,
+      });
+      if (mismatch) {
+        log(`Truth mismatch on ${taskId}: LLM claimed ${llmClaim ? 'success' : 'failure'}, canonical says ${verdict.success ? 'success' : 'failure'} (${verdict.reason || 'ok'})`, this.id);
+      }
+    } catch (e) {
+      // Validation must never break the orchestrator.
+      try { log(`Canonical validation crashed for ${taskId}: ${e.message}`, this.id); } catch {}
+    }
+  }
+
+  async _runWorkerStepWithRetries(step, worker, config, managerName, grantContext = null, { markAgentCompleted = true, taskId = null, isCancelled = () => false } = {}) {
     const visibility = this._parseVisibility(step.visibility, step.task);
     const task = buildManagedWorkerTask(step.task, grantContext?.grant || null, step.resources || null, worker.name);
     const maxRetries = step.retries ?? 2;
@@ -2163,16 +2277,43 @@ class ProjectRunner {
     let lastResult = null;
 
     while (attempt <= maxRetries && !succeeded && this.running && !this.abortCurrentCycle) {
+      if (isCancelled()) {
+        log(`Task ${taskId || worker.name} cancelled by manager; skipping further attempts`, this.id);
+        lastResult = { success: false, cancelled: true, killedByTimeout: false };
+        break;
+      }
       if (attempt > 0) {
         log(`Retrying ${worker.name} (attempt ${attempt + 1}/${maxRetries + 1})`, this.id);
       }
+      appendTaskEvent(this.taskEventsDir, taskId, 'worker_spawned', {
+        attempt: attempt + 1,
+        worker: worker.name,
+      });
       lastResult = await this.runAgent(worker, config, null, task, visibility, {
         primary: false,
         managerName,
         resources: step.resources || null,
         resourceGrant: grantContext?.grant || null,
+        taskId,
       });
       total += 1;
+      appendTaskEvent(this.taskEventsDir, taskId, 'worker_returned', {
+        attempt: attempt + 1,
+        success: !!lastResult?.success,
+        killed_by_timeout: !!lastResult?.killedByTimeout,
+        cancelled: !!lastResult?.cancelled,
+        duration_ms: lastResult?.durationMs ?? null,
+      });
+      // Phase 1 instrumentation: read canonical result from disk and log
+      // disagreement with the LLM's claim. Source of truth stays the LLM
+      // for now; we measure mismatch rate before flipping in Phase 3.
+      this._recordCanonicalValidation(taskId, step, lastResult);
+      if (isCancelled()) {
+        // Aborted mid-run; the LLM CLI was killed via runState.abortController.
+        // Don't count the abort as a permanent failure of the experiment idea.
+        lastResult = { ...(lastResult || {}), success: false, cancelled: true, killedByTimeout: false };
+        break;
+      }
       if (lastResult?.success) {
         succeeded = true;
         if (markAgentCompleted) {
@@ -2211,6 +2352,9 @@ class ProjectRunner {
     if (this.isSingleManagerMode(config) && (step.resources?.gpus || 0) > 0) {
       grantContext = this._tryGrantWorkerResources(step, worker, managerName, config);
       if (grantContext.blocked) {
+        appendTaskEvent(this.taskEventsDir, options.taskId, 'grant_blocked', {
+          reason: grantContext.reason,
+        });
         return {
           started: false,
           blocked: true,
@@ -2218,14 +2362,26 @@ class ProjectRunner {
           workerName: worker.name,
         };
       }
+      if (grantContext?.grant?.id) {
+        appendTaskEvent(this.taskEventsDir, options.taskId, 'granted', {
+          grant_id: grantContext.grant.id,
+          tokens: grantContext.grant.tokenNames || [],
+          worker: worker.name,
+        });
+      }
     }
 
     const promise = this._runWorkerStepWithRetries(step, worker, config, managerName, grantContext, {
       markAgentCompleted: options.markAgentCompleted !== false,
+      taskId: options.taskId || null,
+      isCancelled: typeof options.isCancelled === 'function' ? options.isCancelled : () => false,
     })
       .finally(() => {
         if (grantContext?.grant?.id) {
           this._releaseWorkerGrant(grantContext.grant.id, managerName);
+          appendTaskEvent(this.taskEventsDir, options.taskId, 'released', {
+            grant_id: grantContext.grant.id,
+          });
         }
       });
 
@@ -2404,6 +2560,35 @@ class ProjectRunner {
         const task = runnable[selection.index];
         const assignedWorker = selection.worker;
 
+        // Walltime admission gate: don't start a task that can't finish before
+        // the Slurm allocation expires. Mark blocked (terminal) so the inner
+        // loop continues looking for shorter ready tasks (e.g. analyst gpus=0
+        // tasks). When all ready tasks are walltime-blocked, the cycle drains
+        // and the manager gets a chance to schedule a finalization task.
+        const wtRemaining = remainingWalltimeMs();
+        if (wtRemaining !== null) {
+          const requiredMs = (task.estimatedRuntimeSeconds && task.estimatedRuntimeSeconds > 0
+            ? task.estimatedRuntimeSeconds
+            : 300) * 1000 + 120 * 1000; // +2min slack for setup + tail
+          if (wtRemaining < requiredMs) {
+            log(`Task ${task.id} blocked: insufficient slurm walltime (${Math.floor(wtRemaining/1000)}s remaining < ${Math.floor(requiredMs/1000)}s required)`, this.id);
+            appendTaskEvent(this.taskEventsDir, task.id, 'walltime_blocked', {
+              remaining_seconds: Math.floor(wtRemaining / 1000),
+              required_seconds: Math.floor(requiredMs / 1000),
+            });
+            plan._runtime.taskStates[task.id] = {
+              ...plan._runtime.taskStates[task.id],
+              status: 'blocked',
+              finishedAt: new Date().toISOString(),
+              reason: `insufficient slurm walltime: ${Math.floor(wtRemaining/1000)}s < ${Math.floor(requiredMs/1000)}s`,
+            };
+            failures += 1;
+            total += 1;
+            this.saveState();
+            continue;
+          }
+        }
+
         const pendingAhead = plan._tasks.find((candidate) => {
           const state = plan._runtime.taskStates[candidate.id];
           if (!state || state.status !== 'pending' || candidate.id === task.id) return false;
@@ -2427,14 +2612,24 @@ class ProjectRunner {
         };
         this.saveState();
 
+        appendTaskEvent(this.taskEventsDir, task.id, 'picked', {
+          attempt: plan._runtime.taskStates[task.id].attempts,
+          worker: assignedWorker?.name || null,
+          requested_gpus: task.resources?.gpus || 0,
+          priority: task.priority ?? 0,
+        });
+
         const launched = await this._startScheduledWorker(task, workers, config, managerName, orchestration, {
           markAgentCompleted: false,
           worker: assignedWorker,
           busyWorkerNames: new Set(running.map((entry) => entry.workerName?.toLowerCase()).filter(Boolean)),
+          taskId: task.id,
+          isCancelled: () => plan._runtime.cancelledTaskIds?.has(task.id) === true,
         });
         if (!launched.started) {
           const fit = classifyParallelStepGpuFit(task, availability, orchestration.defaultWorkerResources);
           const status = launched.wait || (launched.blocked && fit.status === 'waiting') ? 'pending' : 'blocked';
+          log(`Task ${task.id} ${status}: ${launched.reason || fit.reason || 'unknown'}`, this.id);
           plan._runtime.taskStates[task.id] = {
             ...plan._runtime.taskStates[task.id],
             status,
@@ -2525,6 +2720,14 @@ class ProjectRunner {
       failures += finished.result.failures;
 
       const currentState = plan._runtime.taskStates[entry.task.id] || {};
+      // If the manager killed this task while it was running, keep the
+      // 'cancelled' state and skip the success/failure write below.
+      if (currentState.status === 'cancelled') {
+        plan._runtime.lastCompletedTaskId = entry.task.id;
+        this.saveState();
+        startLiveReplan(entry.task.id);
+        continue;
+      }
       if (finished.result.success) {
         plan._runtime.taskStates[entry.task.id] = {
           ...currentState,
@@ -2642,6 +2845,28 @@ class ProjectRunner {
     let cycleFailures = 0;
     let cycleTotal = 0;
 
+    // Phase 1.4: emit an aggregate report at cycle exit (regardless of which
+    // return path fires) by reading task-events written during this window.
+    const cycleStartSec = Date.now() / 1000;
+    const cycleId = `${this.cycleCount}`;
+    const emitReport = () => {
+      try {
+        const report = buildCycleReport({
+          eventsDir: this.taskEventsDir,
+          windowStart: cycleStartSec,
+          windowEnd: Date.now() / 1000,
+          gpuCount: this.loadConfig().resourceOrchestration?.gpuCount ?? 8,
+          cycleId,
+        });
+        log(formatCycleReportLine(report), this.id);
+        writeCycleReport({ reportsDir: path.join(this.projectDir, 'cycle-reports'), report });
+      } catch (e) {
+        try { log(`Cycle report failed: ${e.message}`, this.id); } catch {}
+      }
+    };
+
+   try {
+
     for (let managerPass = 0; managerPass < maxManagerPasses && this.running && !this.abortCurrentCycle; managerPass += 1) {
       if (maxWallClockSeconds != null && (Date.now() - startTime) / 1000 >= maxWallClockSeconds) {
         log(`Wall-clock limit reached (${Math.floor((Date.now() - startTime) / 1000)}s >= ${maxWallClockSeconds}s), stopping`, this.id);
@@ -2669,6 +2894,12 @@ class ProjectRunner {
 
       let schedule = null;
       if (result?.resultText) {
+        // Apply manager kill requests against the resumed schedule (if any) before
+        // parsing the new graph, so dependency lineage stays consistent.
+        const killIds = parseKillTasksDocument(result.resultText);
+        if (killIds.length && this._isTaskGraphPlan(this.currentSchedule)) {
+          this._killTaskGraphTasks(this.currentSchedule, killIds);
+        }
         schedule = this.parseSchedule(result.resultText);
         if (schedule) {
           log(`Schedule: ${JSON.stringify(schedule)}`, this.id);
@@ -2718,6 +2949,9 @@ class ProjectRunner {
     }
 
     return { cycleTotal, cycleFailures };
+   } finally {
+     emitReport();
+   }
   }
 
   async runLoop() {
@@ -2909,8 +3143,11 @@ class ProjectRunner {
       }
       const rolePath = path.join(ROOT, 'agent', agent.isManager ? 'manager.md' : 'worker.md');
       sharedRules += fs.readFileSync(rolePath, 'utf-8') + '\n\n---\n\n';
-      if (this.getAgentRuntime() === 'codex_cli') {
+      const activeRuntime = this.getAgentRuntime();
+      if (activeRuntime === 'codex_cli') {
         sharedRules += '\n> **Runtime:** codex_cli\n> You are running through the local Codex CLI runtime, not the JSON API tool runtime. Use normal shell commands when you need to inspect files, run tests, call `tbc-db`, or attach to the shared Slurm allocation. If a task mentions `grant_id`, `lease_job_id`, `gpu_tokens`, or `recommended_cpus_per_task`, use them directly when constructing your `srun --jobid <job> --overlap --ntasks=1 --cpus-per-task <n>` command.\n\n---\n\n';
+      } else if (activeRuntime === 'claude_cli') {
+        sharedRules += '\n> **Runtime:** claude_cli (Claude Code)\n> You are running through the local Claude Code CLI runtime, not the JSON API tool runtime. Use normal shell commands (Bash/Read/Write/Edit/Grep) when you need to inspect files, run tests, call `tbc-db`, or attach to the shared Slurm allocation. If a task mentions `grant_id`, `lease_job_id`, `gpu_tokens`, or `recommended_cpus_per_task`, use them directly when constructing your `srun --jobid <job> --overlap --ntasks=1 --cpus-per-task <n>` command. Do not open GitHub PRs; use `tbc-db pr-create`.\n\n---\n\n';
       }
     } catch {}
 
@@ -3051,6 +3288,7 @@ class ProjectRunner {
       managerName: runOptions.managerName || null,
       resources: runOptions.resources || null,
       resourceGrant: runOptions.resourceGrant || null,
+      taskId: runOptions.taskId || null,
     });
     runState.abortController = runAbortController;
     this._syncCurrentAgentSnapshot();
@@ -3126,6 +3364,34 @@ class ProjectRunner {
         const result = await runAgentWithCodexCLI({
           prompt: skillContent,
           model: codexModel,
+          cwd: this.path,
+          timeoutMs: config.agentTimeoutMs || 0,
+          env: agentEnv,
+          abortSignal: runAbortController.signal,
+          projectDir: this.projectDir,
+          ...sharedRunCallbacks,
+        });
+
+        return this._postProcessAgentRun(agent, config, {
+          resultText: result.resultText,
+          cost: result.cost,
+          durationMs: result.durationMs,
+          killedByTimeout: result.timedOut || false,
+          apiSuccess: result.success,
+          usage: result.usage,
+          rawOutput: result.rawOutput,
+        }, runState);
+      }
+
+      if (agentRuntime === 'claude_cli') {
+        const claudeModel = agent.rawModel || config.models?.[agentTierOrModel] || config.model || null;
+        runState.model = claudeModel ? `claude-cli ${claudeModel}` : 'claude-cli';
+        this._syncCurrentAgentSnapshot();
+        log(`Using Claude CLI runner for ${agent.name}${claudeModel ? ` (model: ${claudeModel})` : ''}`, this.id);
+
+        const result = await runAgentWithClaudeCLI({
+          prompt: skillContent,
+          model: claudeModel,
           cwd: this.path,
           timeoutMs: config.agentTimeoutMs || 0,
           env: agentEnv,
@@ -5389,14 +5655,19 @@ function sleep(ms) {
 
 // --- Preflight checks ---
 function checkPrerequisites() {
-  const missing = [];
   const optional = [];
-  try { execSync('codex --version', { stdio: 'pipe' }); } catch { missing.push('codex (Codex CLI) — required for codex_cli runtime'); }
+  let codexAvailable = false;
+  let claudeAvailable = false;
+  try { execSync('codex --version', { stdio: 'pipe' }); codexAvailable = true; } catch {}
+  try { execSync('claude --version', { stdio: 'pipe' }); claudeAvailable = true; } catch {}
   try { execSync('gh --version', { stdio: 'pipe' }); } catch { optional.push('gh (GitHub CLI) — needed only for listing or creating GitHub repositories'); }
-  if (missing.length > 0) {
-    log('WARNING: Missing required tools:');
-    missing.forEach(m => log(`  - ${m}`));
-    log('Some features will not work without these tools.');
+  if (!codexAvailable && !claudeAvailable) {
+    log('WARNING: Neither codex nor claude CLI is available.');
+    log('  - codex (Codex CLI) — required for agentRuntime: codex_cli');
+    log('  - claude (Claude Code CLI) — required for agentRuntime: claude_cli');
+  } else {
+    if (!codexAvailable) log('Note: codex CLI not found; agentRuntime: codex_cli projects will fail.');
+    if (!claudeAvailable) log('Note: claude CLI not found; agentRuntime: claude_cli projects will fail.');
   }
   if (optional.length > 0) {
     log('Optional integrations unavailable:');

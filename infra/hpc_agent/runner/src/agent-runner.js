@@ -39,6 +39,49 @@ export function resolveCodexCliModel(model) {
   return value;
 }
 
+function looksLikeClaudeCliModel(model) {
+  const value = String(model || '').trim();
+  if (!value) return false;
+  if (value.startsWith('anthropic/')) return true;
+  if (value.startsWith('claude/')) return true;
+  return /^claude[-_]/i.test(value);
+}
+
+export function resolveClaudeCliModel(model) {
+  const value = String(model || '').trim();
+  if (!value) return null;
+  if (!looksLikeClaudeCliModel(value)) return null;
+  if (value.startsWith('anthropic/')) return value.slice('anthropic/'.length);
+  if (value.startsWith('claude/')) return value.slice('claude/'.length);
+  return value;
+}
+
+export function buildClaudeExecInvocation({
+  cwd,
+  writableRoots = [],
+  model = null,
+  outputFile,
+}) {
+  // Claude Code CLI non-interactive form: `claude -p` prints the final
+  // assistant message to stdout. We keep an outputFile path for parity
+  // with the codex invocation builder.
+  const args = [
+    '--print',
+    '--dangerously-skip-permissions',
+    '--output-format', 'text',
+  ];
+  if (cwd) args.push('--add-dir', cwd);
+  for (const extraDir of writableRoots) {
+    if (!extraDir || extraDir === cwd) continue;
+    args.push('--add-dir', extraDir);
+  }
+  const resolvedModel = resolveClaudeCliModel(model);
+  if (resolvedModel) {
+    args.push('--model', resolvedModel);
+  }
+  return { command: 'claude', args, resolvedModel, outputFile };
+}
+
 export function buildCodexExecInvocation({
   cwd,
   writableRoots = [],
@@ -1430,6 +1473,135 @@ export async function runAgentWithCodexCLI(opts) {
         durationMs: Date.now() - startTime,
         timedOut,
         rawOutput,
+      });
+    });
+  });
+}
+
+export async function runAgentWithClaudeCLI(opts) {
+  const {
+    prompt,
+    model = null,
+    cwd,
+    timeoutMs = 0,
+    env = {},
+    abortSignal = null,
+    log = () => {},
+    onEvent = () => {},
+    projectDir = null,
+  } = opts;
+
+  const startTime = Date.now();
+  const usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 };
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hpc-agent-claude-cli-'));
+  const outputFile = path.join(tempDir, 'final-message.txt');
+  const writableRoots = [];
+  if (cwd) writableRoots.push(cwd);
+  if (projectDir) writableRoots.push(projectDir);
+  const invocation = buildClaudeExecInvocation({ cwd, writableRoots, model, outputFile });
+
+  let stdout = '';
+  let stderr = '';
+  let settled = false;
+  let timedOut = false;
+  let child = null;
+  let timeoutHandle = null;
+  const streamBuffers = { stdout: '', stderr: '' };
+
+  const cleanup = () => { try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {} };
+  const killChild = (signal = 'SIGTERM') => {
+    if (!child?.pid) return;
+    try { process.kill(-child.pid, signal); } catch {}
+  };
+
+  let externalAbortHandler = null;
+
+  return await new Promise((resolve) => {
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (abortSignal && externalAbortHandler) {
+        abortSignal.removeEventListener('abort', externalAbortHandler);
+      }
+      cleanup();
+      resolve(payload);
+    };
+
+    timeoutHandle = timeoutMs > 0 ? setTimeout(() => {
+      timedOut = true;
+      log(`⏰ Claude CLI timeout after ${Math.floor((Date.now() - startTime) / 60000)}m`);
+      killChild('SIGTERM');
+      setTimeout(() => killChild('SIGKILL'), 5000);
+    }, timeoutMs) : null;
+
+    if (abortSignal) {
+      if (abortSignal.aborted) {
+        finish({
+          success: false, resultText: '', usage, cost: 0,
+          durationMs: Date.now() - startTime, timedOut: false,
+          rawOutput: 'Claude CLI run aborted before start.',
+        });
+        return;
+      }
+      externalAbortHandler = () => {
+        killChild('SIGTERM');
+        setTimeout(() => killChild('SIGKILL'), 5000);
+      };
+      abortSignal.addEventListener('abort', externalAbortHandler, { once: true });
+    }
+
+    log(`Claude CLI exec${invocation.resolvedModel ? ` (model: ${invocation.resolvedModel})` : ''}`);
+    child = spawn(invocation.command, invocation.args, {
+      cwd,
+      env: { ...process.env, ...env },
+      detached: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    child.stdin.end(`${String(prompt || '').trim()}\n`);
+
+    child.stdout.on('data', (chunk) => {
+      const text = chunk.toString('utf-8');
+      stdout = appendWithLimit(stdout, text);
+      emitStreamLines(streamBuffers, text, 'stdout', onEvent);
+    });
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString('utf-8');
+      stderr = appendWithLimit(stderr, text);
+      emitStreamLines(streamBuffers, text, 'stderr', onEvent);
+    });
+
+    child.on('error', (error) => {
+      finish({
+        success: false, resultText: '', usage, cost: 0,
+        durationMs: Date.now() - startTime, timedOut: false,
+        rawOutput: `Claude CLI failed to start: ${error.message}`,
+      });
+    });
+
+    child.on('close', (code, signal) => {
+      if (streamBuffers.stdout?.trim()) onEvent({ type: 'runtime-log', stream: 'stdout', content: streamBuffers.stdout.trimEnd() });
+      if (streamBuffers.stderr?.trim()) onEvent({ type: 'runtime-log', stream: 'stderr', content: streamBuffers.stderr.trimEnd() });
+
+      let resultText = '';
+      try {
+        if (fs.existsSync(outputFile)) resultText = fs.readFileSync(outputFile, 'utf-8').trim();
+      } catch {}
+      if (!resultText && stdout.trim()) resultText = stdout.trim();
+
+      const rawOutput = [
+        stdout ? `=== CLAUDE STDOUT ===\n${stdout}` : '',
+        stderr ? `=== CLAUDE STDERR ===\n${stderr}` : '',
+        code !== null && code !== undefined ? `exit_code=${code}` : '',
+        signal ? `signal=${signal}` : '',
+      ].filter(Boolean).join('\n\n');
+
+      finish({
+        success: code === 0 && !timedOut,
+        resultText, usage, cost: 0,
+        durationMs: Date.now() - startTime,
+        timedOut, rawOutput,
       });
     });
   });
