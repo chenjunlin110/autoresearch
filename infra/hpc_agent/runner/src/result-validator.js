@@ -1,14 +1,19 @@
 import fs from 'fs';
 import path from 'path';
 
-// Canonical truth source for an autoresearch experiment outcome.
+// Canonical truth source for one task run's outcome.
 //
-// The bash wrapper writes:
-//   result.txt   : exit_code=<int>\noutput_dir=<path>\nmetrics_path=<path>
-//   metrics.json : { val_bpb, training_seconds, num_steps, peak_vram_mb, ... }
+// Every task plugin's wrapper writes two artifacts the framework can read:
+//   result.txt   : at minimum `exit_code=<int>`. Optional: output_dir=, metrics_path=
+//   metrics.json : at minimum the metric the manager optimizes (a finite number).
+//                  By convention the autoresearch task uses `val_bpb`; other
+//                  tasks define their own key but the framework only requires
+//                  it be a finite numeric value at the path the task config
+//                  declares (`config.metricKey`, defaulting to `val_bpb` for
+//                  backward compat with the autoresearch task).
 //
-// This module decides "did the experiment actually succeed" from disk, NOT from
-// the worker LLM's natural-language claim. Worker stdout is debug only.
+// This module decides "did the run actually succeed" from disk, NOT from the
+// worker LLM's natural-language claim. Worker stdout is debug only.
 //
 // Contract:
 //   validateExperimentResult({ outputDir, metricsPath? })
