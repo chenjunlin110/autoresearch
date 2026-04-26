@@ -63,7 +63,7 @@ repo/
 A task plugin needs:
 
 1. **Code that can run end-to-end on its own.** A directory with the executable code and an immutable evaluation harness. For autoresearch this is `autoresearch/train.py + prepare.py`.
-2. **A wrapper script** that runs one experiment and writes `result.txt` (`exit_code=`) + `metrics.json` (`{the_metric: <number>}`) into a per-experiment output dir. For autoresearch this is `infra/hpc_agent/runner/scripts/run-autoresearch-worker.sh`.
+2. **A wrapper script** that runs one experiment and writes `result.txt` (`exit_code=`) + `metrics.json` (`{the_metric: <number>}`) into a per-experiment output dir. For autoresearch this is `tasks/autoresearch/worker.sh`.
 3. **A manager prompt** that describes the search surface, the metric, and how to translate ideas into TASK_GRAPH entries. For autoresearch this is rendered by `autoresearch-dag-full.js:renderAutoresearchFullManagerProgram`.
 4. **A worker prompt** that tells worker LLMs how to apply edits and run the wrapper. Same renderer.
 5. **A workspace generator** that materializes `config.yaml`, `projects.yaml`, `state.json`, manager/worker skill files for the task. `create-autoresearch-dag-full.js` is the example.
@@ -90,7 +90,7 @@ npm test                                                           # unit tests
 cd ../../..
 AUTORESEARCH_AGENT_RUNTIME=claude_cli sbatch --time=02:00:00 \
   --export=ALL,AUTORESEARCH_AGENT_RUNTIME \
-  infra/hpc_agent/runner/scripts/submit-autoresearch-runner.sbatch
+  tasks/autoresearch/submit.sbatch
 ```
 
 ## Status

@@ -1,17 +1,18 @@
-# HPC Agent
+# Search-Task Framework Runner
 
-HPC Agent is a local AI agent runner focused on shared-allocation,
-resource-aware orchestration.
+The runtime under `runner/` is a generic concurrent search-task scheduler. It
+runs an LLM manager that dispatches work to a pool of LLM workers under one
+shared GPU allocation.
 
-Current state:
-
-- runner-only architecture
-- shared-allocation M1 baseline complete
-- M2 single-manager, multi-worker orchestration baseline implemented
-- DAG scheduler with `worker_class` pooled dispatch
-- GPU token admission and graph-drain replanning
-- default local agent runtime: `codex_cli`
-- optional compatibility runtime: `api`
+Current capabilities:
+- single-manager + worker-pool orchestration
+- DAG scheduler with `worker_class` pooled dispatch + `priority` ranking
+- GPU token admission + orphan grant sweep on restart
+- live replan triggered by worker completion
+- manager-issued task kill (`<!-- KILL_TASKS -->`)
+- per-task event trace + per-cycle aggregate report
+- canonical result validation from `result.txt` + `metrics.json`
+- agent runtimes: `codex_cli` (default), `claude_cli`, `api`
 
 ## Setup
 
@@ -19,29 +20,45 @@ Current state:
 bash setup.sh
 ```
 
-This checkout is self-contained and no external upstream checkout is required.
+This checkout is self-contained; no external upstream checkout is required.
 
-## Running the autoresearch loop
+## Running a task
 
-The agent runner must execute on a GPU compute node with direct `/dev/nvidia*`
-access. The old login-node + `srun --overlap` attach path is not usable on this
-cluster (the codex sandbox cannot open slurm stream sockets).
-
-Submit the runner as a sbatch job:
+Each task plugin lives at `<repo>/tasks/<name>/` and supplies its own sbatch
+entrypoint. Submit a task as:
 
 ```bash
-sbatch infra/hpc_agent/runner/scripts/submit-autoresearch-runner.sbatch
+sbatch tasks/<name>/submit.sbatch
 ```
 
-This allocates one 8-GPU node, materializes the dag-full project workspace
-under `artifacts/autoresearch-runner-<timestamp>/`, and starts the agent
-server in foreground for the duration of the job. Logs land in
-`artifacts/autoresearch-runner-<timestamp>/server.log`.
+For the autoresearch task specifically:
+
+```bash
+# default runtime is codex_cli
+sbatch tasks/autoresearch/submit.sbatch
+
+# or use Claude Code as the manager + worker runtime
+AUTORESEARCH_AGENT_RUNTIME=claude_cli sbatch \
+  --export=ALL,AUTORESEARCH_AGENT_RUNTIME \
+  tasks/autoresearch/submit.sbatch
+```
+
+Each run writes to `artifact/<task>/run-<timestamp>/` (gitignored). Logs land
+in `artifact/<task>/run-<timestamp>/server.log`.
 
 Notes:
 
-- local orchestration now defaults to `agentRuntime: codex_cli`
-- provider API keys are only needed for projects that explicitly set `agentRuntime: api`
-- scheduler design: `runner/docs/SCHEDULER.md`
+- Codex sandbox cannot open Slurm stream sockets on this cluster, so the
+  runner executes directly on the GPU compute node via sbatch — there is no
+  login-node + `srun --overlap` attach path.
+- Provider API keys are only needed for projects that set `agentRuntime: api`.
+- Scheduler design: `runner/docs/SCHEDULER.md`
 - Codex runtime notes: `runner/docs/CODEX_LOCAL_RUNTIME.md`
-- resource validation plan: `runner/docs/RESOURCE_ORCHESTRATION_TEST_PLAN.md`
+- Claude Code runtime notes: `runner/docs/CLAUDE_LOCAL_RUNTIME.md`
+- Resource validation plan: `runner/docs/RESOURCE_ORCHESTRATION_TEST_PLAN.md`
+
+## Adding a new task
+
+See [`docs/architecture.md`](../../docs/architecture.md) for the five-piece
+task plugin contract, or run the `/new-task` skill from Claude Code to
+scaffold a task directory from the autoresearch template.

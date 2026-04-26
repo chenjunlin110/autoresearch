@@ -8,7 +8,7 @@ This repo is split into a **framework** (the runner + scheduler) and **tasks** (
 |---|---|---|
 | Framework | `infra/hpc_agent/runner/` | Manager LLM dispatch, worker pool, scheduler, GPU grant lifecycle, live replan, kill, retries, walltime admission, canonical result validation, per-task event trace, cycle reports. None of it knows about train.py. |
 | Task | `autoresearch/`<br>+ task-specific files inside `infra/hpc_agent/runner/` | The runnable code (`train.py`, `prepare.py`), the manager prompt, the worker prompt, the wrapper script, the workspace generator. A planned cleanup moves all task-specific files into `tasks/<name>/`. |
-| Runs | `artifacts/` (gitignored), `experiments/<exp_id>/` (gitignored) | Generated per-run outputs: project DB, state.json, agent skill files, sandbox repos, metrics.json, train.log. Never committed. |
+| Runs | `artifact/<task>/` (gitignored) | Generated per-run outputs: project DB, state.json, agent skill files, sandbox repos, metrics.json, train.log. Never committed. The autoresearch task writes to `artifact/autoresearch/run-<timestamp>/`. |
 
 ## The framework's contract with a task
 

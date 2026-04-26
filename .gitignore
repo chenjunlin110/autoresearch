@@ -18,8 +18,12 @@ AGENTS.md
 .codex
 .codex/
 
-# Experimental code/artifacts
+# Generated per-run outputs (per-task subdir under artifact/).
+# `artifacts/` and `experiments/` are legacy paths from before the
+# tasks/<name>/ split; ignore them too so existing checkouts don't
+# accidentally restage cached run outputs.
 dev/
+artifact/
 artifacts/
 experiments/
 .hf-home/
