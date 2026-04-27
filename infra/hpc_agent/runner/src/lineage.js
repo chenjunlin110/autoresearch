@@ -22,7 +22,11 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { applyEdits } from './edits.js';
 
-const GIT_TIMEOUT_MS = 30000;
+// 120s rather than 30s because `git add -A && git commit` on the task's
+// source/ runs against a network filesystem (weka) where directory walks
+// can be slow even on a small repo. We saw 30s timeouts on KEEP_EXPERIMENT
+// for the autoresearch source/ during the 1580312 verification run.
+const GIT_TIMEOUT_MS = 120000;
 
 /**
  * @typedef {Object} LineageEntry
