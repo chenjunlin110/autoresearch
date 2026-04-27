@@ -64,6 +64,24 @@ test('buildExperimentLedger: clusters failures by reason prefix', () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('formatLedgerMarkdown: surfaces rationale next to outcome', () => {
+  const dir = mkEvents([
+    ['exp_aspect_96', [
+      { name: 'picked', t: 100,
+        rationale: 'wider aspect ratio matches FFN at this depth',
+        task_summary: 'sweep aspect=96',
+        base_ref: 'HEAD' },
+      { name: 'validated', canonical_success: true, val_bpb: 0.99, training_seconds: 300 },
+      { name: 'released', t: 400 },
+    ]],
+  ]);
+  const ledger = buildExperimentLedger({ eventsDir: dir });
+  const text = formatLedgerMarkdown(ledger);
+  assert.match(text, /exp_aspect_96/);
+  assert.match(text, /hypothesis: wider aspect ratio matches FFN/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('formatLedgerMarkdown: emits headers and entries when ledger non-empty', () => {
   const dir = mkEvents([
     ['exp_top', [

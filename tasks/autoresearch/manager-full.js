@@ -222,14 +222,24 @@ After each result lands, decide: was this branch's edit a win? If yes, future ex
 
 A failed \`param_patch\` task writes \`${experimentName}/<id>/failure.json\` with the structured reason — typically "expected_old_repr didn't match" (your read of train.py was stale) or "no module-level assignment to <name>" (the symbol you targeted lives inside a function). Read it before emitting more edits in the same neighborhood. If the fix is obvious (correct \`expected_old_repr\`), emit a corrected \`param_patch\` with a new id. If the change is genuinely free-form, switch to \`llm_repair\` or just \`code_edit\` for a fresh attempt.
 
+## Rationale is mandatory — it is your memory
+
+Every task you emit MUST include a \`rationale\` field stating, in one sentence, **what you are testing and why you expect it to help**. Examples:
+- \`"rationale": "wider aspect ratio (96 vs 64) better matches the FFN dim at this depth"\`
+- \`"rationale": "lr=3e-3 is conservative; if 6e-3 also lands we have a longer LR plateau to exploit"\`
+- \`"rationale": "depth=12 to test whether the depth=10 win extrapolates"\`
+
+Why this is non-negotiable: the runtime context you receive next time will replay each completed experiment as **rationale → outcome**. Without rationale you literally cannot tell, on the next call, whether \`exp_0010_aspect_96\` won by luck or because aspect ratio is real signal. The rationale is your reasoning trace across cycles.
+
 ## The loop
 
-You will be called continuously. Every time a worker finishes and returns its GPU token, the runner calls you again with the latest state. On each call:
+You will be called continuously. Every time the runtime queue runs shallow, the runner calls you again with the latest state. On each call:
 
-1. Read prior \`${experimentName}/**/experiment.md\`, \`metrics.json\`, \`result.txt\`, and any \`failure.json\` to see what's been tried, what won, and what failed.
-2. Decide what to try next.
-3. Append new tasks to the live TASK_GRAPH. Do not repeat existing task ids. New tasks must not depend on still-running task ids or unproduced tags.
-4. Keep around ${experimentsPerWave}-${backlogTarget} ready/pending GPU tasks queued so tokens never sit idle.
+1. **Read your past hypotheses next to their results** in the runtime context the runner just gave you (top-K + recent). Look for *patterns*: which axis (depth, aspect, LR, beta_2, attention) actually moved \`val_bpb\`? Which "should have helped" hypothesis didn't? Disqualify dead axes; double down on live ones.
+2. If you need more detail than the ledger one-liners give, read \`${experimentName}/<id>/metrics.json\`, \`failure.json\`, or the per-experiment \`train.py\` (its diff vs the source baseline).
+3. Decide what to try next based on the patterns. **Exploit when you have a winner**: emit a fan-out around that winner's axis (e.g. winner is aspect=96 → try aspect=80, 112, plus aspect=96 combined with the next-best axis). **Explore when nothing's separating from baseline**: shift to a different axis you haven't explored.
+4. Append new tasks to the live TASK_GRAPH. Each task carries a \`rationale\` (see above). Do not repeat existing task ids. New tasks must not depend on still-running task ids or unproduced tags.
+5. Keep around ${experimentsPerWave}-${backlogTarget} ready/pending GPU tasks queued so tokens never sit idle. Better to over-emit than under-emit: extra tasks just queue.
 
 Don't emit \`PROJECT_COMPLETE\`. If you run out of ideas: re-read \`${workloadRoot}/train.py\` for fresh angles, combine previous near-misses, try more radical architecture changes, or read papers referenced in the code.
 

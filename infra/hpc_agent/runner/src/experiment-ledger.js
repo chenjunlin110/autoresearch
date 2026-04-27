@@ -80,12 +80,20 @@ function reduceDoc(doc, metricKey) {
 
   const startedAt = typeof picked?.t === 'number' ? picked.t : null;
   const finishedAt = typeof released?.t === 'number' ? released.t : null;
+  // Manager-provided framing captured at pick time (Phase 5.4 epistemic
+  // memory loop). Either field may be absent for tasks emitted before
+  // the field was wired.
+  const rationale = typeof picked?.rationale === 'string' ? picked.rationale : null;
+  const taskSummary = typeof picked?.task_summary === 'string' ? picked.task_summary : null;
+  const baseRef = typeof picked?.base_ref === 'string' ? picked.base_ref : null;
+
+  const baseRecord = { id: doc.task_id, rationale, taskSummary, baseRef };
 
   if (validated) {
     const metric = validated[metricKey];
     if (validated.canonical_success && typeof metric === 'number' && Number.isFinite(metric)) {
       return {
-        id: doc.task_id,
+        ...baseRecord,
         status: 'completed',
         metric,
         trainingSeconds: typeof validated.training_seconds === 'number' ? validated.training_seconds : null,
@@ -94,7 +102,7 @@ function reduceDoc(doc, metricKey) {
       };
     }
     return {
-      id: doc.task_id,
+      ...baseRecord,
       status: 'failed',
       reason: validated.reason || 'validated_failure',
       startedAt,
@@ -103,7 +111,7 @@ function reduceDoc(doc, metricKey) {
   }
   if (workerReturned && !workerReturned.success) {
     return {
-      id: doc.task_id,
+      ...baseRecord,
       status: 'failed',
       reason: workerReturned.killed_by_timeout ? 'killed_by_timeout' : (workerReturned.cancelled ? 'cancelled' : 'worker_returned_failure'),
       startedAt,
@@ -112,7 +120,7 @@ function reduceDoc(doc, metricKey) {
   }
   if (grantBlocked) {
     return {
-      id: doc.task_id,
+      ...baseRecord,
       status: 'failed',
       reason: `grant_blocked: ${grantBlocked.reason || 'unknown'}`,
       startedAt,
@@ -120,7 +128,7 @@ function reduceDoc(doc, metricKey) {
   }
   if (walltimeBlocked) {
     return {
-      id: doc.task_id,
+      ...baseRecord,
       status: 'failed',
       reason: 'walltime_blocked',
       startedAt,
@@ -128,7 +136,7 @@ function reduceDoc(doc, metricKey) {
   }
   if (picked && !released) {
     return {
-      id: doc.task_id,
+      ...baseRecord,
       status: 'running',
       startedAt,
     };
@@ -244,28 +252,54 @@ export function computeEditConfidence({
  * @param {string=} metricKey  shown in headers/cells; default val_bpb
  * @return {string}
  */
+/**
+ * Pull the most informative one-liner the manager wrote about this
+ * experiment when it dispatched: the explicit `rationale` field, or
+ * else the first line of the task body. Keeps the ledger row readable.
+ *
+ * @param {ExperimentRecord} record
+ * @return {string|null}
+ */
+function frameOf(record) {
+  const text = record.rationale || record.taskSummary || null;
+  if (!text) return null;
+  return text.length > 140 ? `${text.slice(0, 137)}…` : text;
+}
+
 export function formatLedgerMarkdown(ledger, metricKey = DEFAULT_METRIC_KEY) {
   if (!ledger) return '';
   const sections = [];
   if (ledger.topK.length > 0) {
+    // Top-K is what we want the manager to *exploit* — show its own
+    // hypothesis next to each so it can recognize "wider aspect helps"
+    // as a real direction instead of a coincidence on a single id.
     sections.push(`> **Top-${ledger.topK.length} by ${metricKey} (lower is better):**`);
     for (const record of ledger.topK) {
       const train = record.trainingSeconds != null
         ? ` (${Math.round(record.trainingSeconds)}s train)`
         : '';
-      sections.push(`> - ${record.id}: ${metricKey}=${record.metric.toFixed(4)}${train}`);
+      const frame = frameOf(record);
+      const lineage = record.baseRef && record.baseRef !== 'HEAD' ? ` ← ${record.baseRef}` : '';
+      const head = `> - ${record.id}: ${metricKey}=${record.metric.toFixed(4)}${train}${lineage}`;
+      sections.push(head);
+      if (frame) sections.push(`>     hypothesis: ${frame}`);
     }
   }
   if (ledger.running.length > 0) {
     sections.push('', `> **Running (${ledger.running.length}):** ${ledger.running.map((r) => r.id).join(', ')}`);
   }
   if (ledger.recent.length > 0) {
-    sections.push('', `> **Recent ${ledger.recent.length}:**`);
-    for (const record of ledger.recent.slice(0, 5)) {
+    // Recent is for *learning* — what just happened to inform what
+    // to try next. Surface the rationale here too so the manager
+    // sees its own framing turn into a result.
+    sections.push('', `> **Recent ${Math.min(ledger.recent.length, 8)} (newest first):**`);
+    for (const record of ledger.recent.slice(0, 8)) {
       const tag = record.status === 'completed'
         ? `${metricKey}=${record.metric.toFixed(4)}`
-        : `failed: ${(record.reason || '').slice(0, 50)}`;
+        : `failed: ${(record.reason || '').slice(0, 60)}`;
       sections.push(`> - ${record.id} — ${tag}`);
+      const frame = frameOf(record);
+      if (frame) sections.push(`>     hypothesis: ${frame}`);
     }
   }
   if (ledger.failedClusters.length > 0) {

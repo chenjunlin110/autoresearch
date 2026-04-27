@@ -2863,11 +2863,24 @@ class ProjectRunner {
         };
         this.saveState();
 
+        // Capture the manager's own framing for this task — `rationale`
+        // (when set explicitly) plus a trimmed first line of the task body
+        // — so the next replan's ledger can show "what I said I was
+        // testing → what came back". Restores the epistemic-memory loop
+        // we lost when param_patch removed the worker LLM that used to
+        // write experiment.md.
+        const taskFirstLine = typeof task.task === 'string'
+          ? task.task.split(/\r?\n/)[0].trim().slice(0, 240)
+          : null;
         appendTaskEvent(this.taskEventsDir, task.id, 'picked', {
           attempt: plan._runtime.taskStates[task.id].attempts,
           worker: assignedWorker?.name || null,
           requested_gpus: task.resources?.gpus || 0,
           priority: task.priority ?? 0,
+          execution_mode: task.executionMode || 'code_edit',
+          base_ref: task.baseRef || null,
+          rationale: task.rationale || null,
+          task_summary: taskFirstLine,
         });
 
         const launched = await this._startScheduledWorker(task, workers, config, managerName, orchestration, {
