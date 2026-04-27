@@ -109,6 +109,36 @@ function parseSummarizeCooldown(message) {
   return 5 * 60_000;
 }
 
+/**
+ * Compress an edits[] array into the kind of single line the manager
+ * needs when scanning past hypotheses: `"ASPECT_RATIO 64→96; DEPTH 8→12"`.
+ * Returns null when nothing useful can be summarized (LLM-edit tasks,
+ * unified diffs, regex rewrites without obvious before/after).
+ *
+ * @param {Array<Object>|null|undefined} edits
+ * @return {string|null}
+ */
+function summarizeEditsForLedger(edits) {
+  if (!Array.isArray(edits) || edits.length === 0) return null;
+  const parts = [];
+  for (const edit of edits) {
+    if (!edit || typeof edit !== 'object') continue;
+    if (edit.kind === 'constant_replace' && edit.name) {
+      parts.push(`${edit.name} ${edit.expected_old_repr}→${edit.new_repr}`);
+    } else if (edit.kind === 'regex_replace' && typeof edit.pattern === 'string') {
+      parts.push(`regex(${edit.pattern.slice(0, 40)})→(${(edit.replacement || '').slice(0, 40)})`);
+    } else if (edit.kind === 'block_replace') {
+      parts.push(`block(${(edit.anchor_regex || '').slice(0, 32)}…)`);
+    } else if (edit.kind === 'unified_diff') {
+      parts.push('unified_diff');
+    }
+    if (parts.join('; ').length > 160) break;
+  }
+  if (parts.length === 0) return null;
+  const joined = parts.join('; ');
+  return joined.length > 180 ? `${joined.slice(0, 177)}…` : joined;
+}
+
 function normalizeAgentRuntime(value) {
   const runtime = String(value || '').trim().toLowerCase();
   if (runtime === 'api') return 'api';
@@ -2551,6 +2581,10 @@ class ProjectRunner {
         const env = { ...directConfig.envOverrides };
         env.AUTORESEARCH_TIME_BUDGET_SECONDS = String(directConfig.timeBudgetSeconds);
         if (cudaDevices.length > 0) env.CUDA_VISIBLE_DEVICES = cudaDevices.join(',');
+        if (step.earlyStop) {
+          env.AUTORESEARCH_EARLY_STOP_AFTER_S = String(step.earlyStop.checkAtSeconds);
+          env.AUTORESEARCH_EARLY_STOP_LOSS_ABOVE = String(step.earlyStop.abortIfLossAbove);
+        }
 
         result = await runDirectTask({
           sourceRepoPath: directConfig.sourceRepoPath,
@@ -2881,6 +2915,11 @@ class ProjectRunner {
           base_ref: task.baseRef || null,
           rationale: task.rationale || null,
           task_summary: taskFirstLine,
+          // Compact one-line summary of structured edits so the ledger
+          // can show "ASPECT_RATIO: 64→96; DEPTH: 8→10" alongside the
+          // rationale. Skipped for code_edit / unified_diff (no
+          // structured form).
+          edit_summary: summarizeEditsForLedger(task.edits),
         });
 
         const launched = await this._startScheduledWorker(task, workers, config, managerName, orchestration, {

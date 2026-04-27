@@ -164,6 +164,18 @@ Four kinds, in order of preference:
 
 Multiple edits to the same task are applied atomically; if any one fails, none take effect. Read \`train.py\` (or the parent experiment's \`train.py\`) before emitting edits — if your \`expected_old_repr\` is wrong, the task fails before training starts.
 
+## Optional: early-stop a clearly-failing experiment
+
+Each task may carry an \`early_stop\` field that tells the wrapper to abort training partway through if the live training loss is above a threshold you set. This saves GPU on experiments diverging fast — useful for aggressive LR sweeps or radical architecture tries.
+
+\`\`\`json
+"early_stop": {"check_at_seconds": 90, "abort_if_loss_above": 4.0}
+\`\`\`
+
+Both keys are required when present; the wrapper waits \`check_at_seconds\` into training, peeks at the latest \`loss: X.XX\` from \`train.log\`, and SIGTERMs training if it exceeds \`abort_if_loss_above\`. **Note that this is the *training loss* (printed every step), not val_bpb (only computed at the end).** Pick the threshold by reference to the recent baseline's loss curve at the same point — re-read \`${experimentName}/exp_*/train.log\` for typical loss-at-90s values before setting one. Conservative (high) thresholds = rarely fire; aggressive (low) thresholds = save GPU but risk killing slow-converging-but-eventual-winners. **Default: don't set \`early_stop\` unless you have a specific reason to.**
+
+When triggered, the experiment ends with \`exit_code != 0\` and \`early_stop_triggered=1\` in \`result.txt\`. The validator marks it failed; you'll see it in failure clusters next cycle.
+
 ## Worked TASK_GRAPH
 
 \`\`\`json

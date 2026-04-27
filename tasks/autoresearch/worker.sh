@@ -94,9 +94,53 @@ fi
 # means timeout fired and the child obeyed SIGTERM; 137 means SIGKILL had to
 # escalate. Either is "training_timeout" to the validator.
 set +e
-timeout --kill-after=15s "${train_timeout}s" "${cmd[@]}" > "$output_dir/train.log" 2>&1
+timeout --kill-after=15s "${train_timeout}s" "${cmd[@]}" > "$output_dir/train.log" 2>&1 &
+train_pid=$!
+
+# Manager-driven early stop: if AUTORESEARCH_EARLY_STOP_AFTER_S is set,
+# wait that many seconds, then peek at the latest `loss: <number>` line
+# train.py prints each step. If the latest loss exceeds the threshold,
+# kill the training group early — saves GPU on hypotheses that are
+# clearly diverging without waiting for the full budget.
+early_stop_triggered=0
+early_stop_loss=""
+if [[ -n "${AUTORESEARCH_EARLY_STOP_AFTER_S:-}" && -n "${AUTORESEARCH_EARLY_STOP_LOSS_ABOVE:-}" ]]; then
+  (
+    sleep "$AUTORESEARCH_EARLY_STOP_AFTER_S"
+    if kill -0 "$train_pid" 2>/dev/null; then
+      latest_loss="$(grep -oE 'loss:[[:space:]]*[0-9]+\.[0-9]+' "$output_dir/train.log" 2>/dev/null \
+        | tail -n 1 | grep -oE '[0-9]+\.[0-9]+')"
+      if [[ -n "$latest_loss" ]] && awk \
+        -v cur="$latest_loss" -v thr="$AUTORESEARCH_EARLY_STOP_LOSS_ABOVE" \
+        'BEGIN{exit !(cur+0 > thr+0)}'; then
+        echo "early_stop_triggered=1 latest_loss=$latest_loss threshold=$AUTORESEARCH_EARLY_STOP_LOSS_ABOVE" \
+          > "$output_dir/early_stop.log"
+        kill -TERM "$train_pid" 2>/dev/null || true
+        sleep 5
+        kill -KILL "$train_pid" 2>/dev/null || true
+      fi
+    fi
+  ) &
+  watcher_pid=$!
+fi
+
+wait "$train_pid"
 exit_code=$?
 set -e
+
+# If the watcher fired, signal it via the early_stop.log file and treat
+# it as a deliberate "abort", not a runaway timeout.
+if [[ -f "$output_dir/early_stop.log" ]]; then
+  early_stop_triggered=1
+  early_stop_loss="$(grep -oE 'latest_loss=[0-9.]+' "$output_dir/early_stop.log" \
+    | head -1 | cut -d= -f2)"
+fi
+
+# Best-effort cleanup of the watcher subshell if training finished first.
+if [[ -n "${watcher_pid:-}" ]]; then
+  kill "$watcher_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+fi
 
 timed_out=0
 if [[ "$exit_code" == "124" || "$exit_code" == "137" ]]; then
@@ -109,6 +153,10 @@ fi
   echo "metrics_path=$AUTORESEARCH_METRICS_PATH"
   echo "timed_out=$timed_out"
   echo "train_timeout_seconds=$train_timeout"
+  echo "early_stop_triggered=$early_stop_triggered"
+  if [[ -n "$early_stop_loss" ]]; then
+    echo "early_stop_loss=$early_stop_loss"
+  fi
 } > "$output_dir/result.txt"
 
 if [[ -n "${AUTORESEARCH_RESULTS_PATH:-}" ]]; then

@@ -210,6 +210,32 @@ test('parseTaskGraphDocument: rejects malformed edit kinds', () => {
     `expected count error, got: ${errors.join(' | ')}`);
 });
 
+test('parseTaskGraphDocument: accepts well-formed early_stop and surfaces it on the task', () => {
+  const graph = parseTaskGraphDocument(`
+<!-- TASK_GRAPH -->
+{"tasks":[{"id":"x","agent":"a","task":"y",
+  "early_stop":{"check_at_seconds":90,"abort_if_loss_above":4.0}}]}
+<!-- /TASK_GRAPH -->
+  `);
+  assert.ok(graph);
+  assert.deepEqual(graph._tasks[0].earlyStop, {
+    checkAtSeconds: 90,
+    abortIfLossAbove: 4.0,
+  });
+});
+
+test('parseTaskGraphDocument: rejects malformed early_stop', () => {
+  const errors = [];
+  const graph = parseTaskGraphDocument(`
+<!-- TASK_GRAPH -->
+{"tasks":[{"id":"x","agent":"a","task":"y",
+  "early_stop":{"check_at_seconds":90}}]}
+<!-- /TASK_GRAPH -->
+  `, undefined, { errors });
+  assert.equal(graph, null);
+  assert.ok(errors.some((e) => /early_stop must be/.test(e)));
+});
+
 test('parseTaskGraphDocument: rejects unknown execution_mode', () => {
   const errors = [];
   const graph = parseTaskGraphDocument(`

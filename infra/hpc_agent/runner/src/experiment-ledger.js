@@ -86,8 +86,9 @@ function reduceDoc(doc, metricKey) {
   const rationale = typeof picked?.rationale === 'string' ? picked.rationale : null;
   const taskSummary = typeof picked?.task_summary === 'string' ? picked.task_summary : null;
   const baseRef = typeof picked?.base_ref === 'string' ? picked.base_ref : null;
+  const editSummary = typeof picked?.edit_summary === 'string' ? picked.edit_summary : null;
 
-  const baseRecord = { id: doc.task_id, rationale, taskSummary, baseRef };
+  const baseRecord = { id: doc.task_id, rationale, taskSummary, baseRef, editSummary };
 
   if (validated) {
     const metric = validated[metricKey];
@@ -282,6 +283,7 @@ export function formatLedgerMarkdown(ledger, metricKey = DEFAULT_METRIC_KEY) {
       const lineage = record.baseRef && record.baseRef !== 'HEAD' ? ` ← ${record.baseRef}` : '';
       const head = `> - ${record.id}: ${metricKey}=${record.metric.toFixed(4)}${train}${lineage}`;
       sections.push(head);
+      if (record.editSummary) sections.push(`>     edit: ${record.editSummary}`);
       if (frame) sections.push(`>     hypothesis: ${frame}`);
     }
   }
@@ -298,6 +300,7 @@ export function formatLedgerMarkdown(ledger, metricKey = DEFAULT_METRIC_KEY) {
         ? `${metricKey}=${record.metric.toFixed(4)}`
         : `failed: ${(record.reason || '').slice(0, 60)}`;
       sections.push(`> - ${record.id} — ${tag}`);
+      if (record.editSummary) sections.push(`>     edit: ${record.editSummary}`);
       const frame = frameOf(record);
       if (frame) sections.push(`>     hypothesis: ${frame}`);
     }

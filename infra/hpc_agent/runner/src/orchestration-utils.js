@@ -83,6 +83,29 @@ const VALID_EDIT_KINDS = new Set([
  * @param {unknown} edits
  * @return {string|null}
  */
+/**
+ * Normalize an optional `early_stop` field on a task. Returns:
+ *   - the normalized object on success
+ *   - `null` when the field is unset (no early-stop)
+ *   - `false` when the field was provided but malformed (caller should reject)
+ *
+ * Schema: `{check_at_seconds: int>0, abort_if_loss_above: finite number}`.
+ * Both keys are required if `early_stop` is present at all — half-set
+ * configs would be footguns.
+ *
+ * @param {unknown} input
+ * @return {Object|null|false}
+ */
+function normalizeEarlyStop(input) {
+  if (input === undefined || input === null) return null;
+  if (typeof input !== 'object' || Array.isArray(input)) return false;
+  const checkAt = input.check_at_seconds ?? input.checkAtSeconds;
+  const abortAbove = input.abort_if_loss_above ?? input.abortIfLossAbove;
+  if (!Number.isInteger(checkAt) || checkAt <= 0) return false;
+  if (typeof abortAbove !== 'number' || !Number.isFinite(abortAbove)) return false;
+  return { checkAtSeconds: checkAt, abortIfLossAbove: abortAbove };
+}
+
 function validateEdits(edits) {
   if (!Array.isArray(edits)) return 'edits must be an array';
   for (let i = 0; i < edits.length; i += 1) {
@@ -373,6 +396,11 @@ export function parseTaskGraphDocument(resultText, defaultWorkerResources = DEFA
       && (task.base_ref ?? task.baseRef).trim()
       ? (task.base_ref ?? task.baseRef).trim()
       : null;
+    const earlyStop = normalizeEarlyStop(task.early_stop ?? task.earlyStop);
+    if (earlyStop === false) {
+      pushError(`${pos} (${id}): early_stop must be {check_at_seconds:int>0, abort_if_loss_above:number}`);
+      return null;
+    }
     return {
       id,
       type: 'agent',
@@ -382,6 +410,7 @@ export function parseTaskGraphDocument(resultText, defaultWorkerResources = DEFA
       executionMode,
       edits,
       baseRef,
+      earlyStop,
       rationale: typeof task.rationale === 'string' ? task.rationale.trim() : null,
       visibility: normalizeVisibility(task.visibility),
       resources: normalizeWorkerResources(task.resources, defaultWorkerResources),
