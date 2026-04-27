@@ -1,17 +1,34 @@
 # Search-Task Framework Runner
 
 The runtime under `runner/` is a generic concurrent search-task scheduler. It
-runs an LLM manager that dispatches work to a pool of LLM workers under one
-shared GPU allocation.
+runs an LLM manager that proposes experiments and dispatches them either via
+a deterministic direct executor (no per-task LLM cost) or a worker-LLM
+fallback path, all under one shared GPU allocation.
 
 Current capabilities:
 - single-manager + worker-pool orchestration
 - DAG scheduler with `worker_class` pooled dispatch + `priority` ranking
+- two execution paths the manager picks per task:
+  - `param_patch` — structured `edits[]` applied by the direct executor with
+    no worker LLM (constant_replace with Python AST normalization,
+    regex_replace with mandatory match-count, block_replace, unified_diff)
+  - `code_edit` / `llm_repair` — worker LLM rewrites code in natural language
 - GPU token admission + orphan grant sweep on restart
-- live replan triggered by worker completion
+- watermark-gated live replan (manager only wakes when ready+running queue
+  drops below `1.5 × maxConcurrentWorkers`)
 - manager-issued task kill (`<!-- KILL_TASKS -->`)
+- three concentric timeout rings: in-wrapper `timeout` around train.py, a
+  900s outer hard cap on the orchestrator side, manager-decided per-task
+  early-stop on training loss
 - per-task event trace + per-cycle aggregate report
-- canonical result validation from `result.txt` + `metrics.json`
+- compact experiment ledger that surfaces `rationale → outcome` to the
+  manager so it can pattern-match its own past hypotheses
+- canonical result validation from `result.txt` + `metrics.json`; logs
+  LLM-claim/canonical mismatch as instrumentation
+- nvidia-smi drain probe after a kill before reissuing freed tokens
+- persistent shared `torch.compile` cache at
+  `$HOME/.cache/autoresearch-shared-cache/` so cycle-1 of run N reuses
+  kernels compiled by run N-1
 - agent runtimes: `codex_cli` (default), `claude_cli`, `api`
 
 ## Setup
@@ -41,6 +58,9 @@ sbatch tasks/autoresearch/submit.sbatch
 AUTORESEARCH_AGENT_RUNTIME=claude_cli sbatch \
   --export=ALL,AUTORESEARCH_AGENT_RUNTIME \
   tasks/autoresearch/submit.sbatch
+
+# Karpathy-style 1-GPU single-agent baseline (for comparison)
+sbatch tasks/autoresearch/baseline-submit.sbatch
 ```
 
 Each run writes to `artifact/<task>/run-<timestamp>/` (gitignored). Logs land

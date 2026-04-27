@@ -1,5 +1,106 @@
 # Changelog
 
+## 2026-04-26 → 2026-04-27 (redesign v1.5)
+
+A six-phase redesign that landed in two days. Verified end-to-end on a 1h
+sbatch (job 1579909): 27 successful experiments, 93% of dispatch went
+through the new direct executor, manager Opus calls dropped to ~0.5 per
+worker completion (was ~1:1).
+
+### Added — observability + safety (Phases 0/1/2)
+
+- `task-events.js`: per-task lifecycle event log under
+  `<projectDir>/task-events/<task_id>.json`. Atomic append-and-rename so
+  concurrent worker writes don't tear.
+- `result-validator.js`: canonical truth from `result.txt` + `metrics.json`.
+  Phase 1 logs LLM-claim vs canonical mismatch as instrumentation; Phase
+  3+ direct executor uses it as the source of truth.
+- `slurm-walltime.js`: walltime admission gate. `_executeTaskGraph`
+  refuses to dispatch tasks whose `estimated_runtime_seconds + 120s`
+  would overrun the remaining sbatch wall.
+- `cycle-report.js`: per-cycle aggregate (counts, GPU duty cycle, time
+  buckets, best metric, mismatch count) written to
+  `<projectDir>/cycle-reports/cycle-<ts>.json`.
+- `gpu-probe.js`: `nvidia-smi --query-compute-apps` post-mortem after a
+  hard-cap kill to confirm the GPU is drained before reissuing the token.
+- Three concentric timeout rings: in-`worker.sh` `timeout` around train.py,
+  900s outer hard cap on the orchestrator side via `setTimeout` +
+  `abortController`, and a manager-decided per-task early-stop on training
+  loss.
+- `flock` on the `results.tsv` append in worker.sh.
+
+### Added — direct executor + structured edits (Phase 3)
+
+- `edits.js` + `edits-ast.py`: four edit kinds (`constant_replace`
+  with Python AST normalization so `2**19` matches `524288`, `regex_replace`
+  with mandatory `expected_count`, `block_replace`, `unified_diff` via
+  `git apply`). Per-file atomic application.
+- `direct-executor.js`: clone source repo → SHA-pin parent commit →
+  apply edits → ast.parse-check the patched files → commit → spawn the
+  task plugin's wrapper detached (own pgroup) → validate result.txt +
+  metrics.json. Idempotent on experiment id (refuses
+  `experiment_id_already_used`). Writes structured `failure.json` for the
+  manager to read on its next replan.
+- `TASK_GRAPH` schema: accepts `execution_mode` ∈ {`code_edit`,
+  `param_patch`, `llm_repair`}, `edits[]` with per-kind validation,
+  `base_ref` (default `HEAD`), `rationale` (required for memory loop),
+  optional `early_stop`.
+- `_startScheduledWorker` branches: `param_patch` → no LLM, runs through
+  `_startDirectExecutorTask` (synthetic worker registered in `activeRuns`
+  so KILL_TASKS still reaches it); else → existing LLM-worker path.
+
+### Added — throughput (Phase 4)
+
+- Persistent shared `torch.compile` cache at
+  `$HOME/.cache/autoresearch-shared-cache/{inductor,triton,uv,hf,xdg}`.
+  Pinned via `AUTORESEARCH_SHARED_CACHE_ROOT` env in `submit.sbatch` and
+  `directExecutor.envOverrides`. Cycle-1 of run N reuses kernels compiled
+  by run N-1.
+
+### Added — efficiency + research quality (Phase 5)
+
+- Watermark-gated live replan: manager only wakes when `ready + running
+  < ⌈1.5 × maxConcurrentWorkers⌉`. Completion events queue FIFO behind
+  the gate. Dropped manager-call rate from 1:1 to ~0.5:1 in verification.
+- `experiment-ledger.js`: builds top-K + recent + failed-clusters from
+  task-events. Each row carries the manager's `rationale`, structural
+  `edit_summary` (`ASPECT_RATIO 64→96`), and outcome — restoring the
+  Karpathy-style "I hypothesized X → result Y" memory that param_patch
+  removed by getting rid of the worker LLM.
+- `computeEditConfidence`: telegraphs `< 70%` recent direct-executor
+  success in the next manager prompt so it re-reads train.py before
+  emitting more edits.
+
+### Reorganization
+
+- `infra/hpc_agent/runner/src/autoresearch-dag-full.js` →
+  `tasks/autoresearch/manager-full.js`
+- `infra/hpc_agent/runner/scripts/run-autoresearch-worker.sh` →
+  `tasks/autoresearch/worker.sh`
+- `infra/hpc_agent/runner/scripts/submit-autoresearch-runner.sbatch` →
+  `tasks/autoresearch/submit.sbatch`
+- Top-level `autoresearch/` → `tasks/autoresearch/source/`
+- Per-run outputs from `artifacts/<...>` (plural) → `artifact/<task>/run-<ts>/`
+- New `/new-task` skill to scaffold a fresh task plugin from the
+  autoresearch template.
+- Added `tasks/autoresearch/baseline-submit.sbatch` for the Karpathy-
+  style 1-GPU single-agent comparison.
+
+### Tests
+
+52 → 92 passing. New suites: `edits.test.js` (14), `direct-executor.test.js`
+(8), `experiment-ledger.test.js` (7), `hard-cap.test.js` (2), plus
+extensions to `orchestration-utils.test.js` (5) and `task-events.test.js`.
+
+### Verified outcomes (1h sbatch, claude_cli runtime)
+
+- 93% of dispatched tasks went through the direct executor (no worker LLM)
+- 93% success rate (27 / 29 spawns)
+- 0.5 manager calls per worker completion
+- 118 inductor + 195 triton entries persisted in the shared cache
+- Duty cycle 28.1% — same as baseline; the unlock is on the *next* sbatch
+  (cycle-1 hits the now-warm persistent cache)
+
 ## 2026-04-24
 
 ### Added

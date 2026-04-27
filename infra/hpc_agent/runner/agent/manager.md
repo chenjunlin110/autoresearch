@@ -128,16 +128,33 @@ In single-manager mode, when dependencies matter, you may instead emit:
     {
       "id": "exp_a",
       "worker_class": "experiment_runner",
-      "task": "Run experiment A",
+      "execution_mode": "param_patch",
+      "base_ref": "HEAD",
+      "rationale": "Sweep aspect_ratio=96; FFN dim suggests 96 fits better than 64.",
+      "task": "Run experiment A: aspect_ratio sweep",
+      "edits": [
+        {"file": "train.py", "kind": "constant_replace",
+         "name": "ASPECT_RATIO", "expected_old_repr": "64", "new_repr": "96"}
+      ],
       "resources": {"gpus": 1, "cpus": 1},
+      "estimated_runtime_seconds": 320,
       "produces_tags": ["metrics:a"]
+    },
+    {
+      "id": "exp_b",
+      "worker_class": "experiment_runner",
+      "execution_mode": "code_edit",
+      "rationale": "Replace SDPA with sliding-window attention; structural change beyond a constant patch.",
+      "task": "In train.py, swap scaled-dot-product attention for sliding-window attention with window=128.",
+      "resources": {"gpus": 1, "cpus": 1},
+      "produces_tags": ["metrics:b"]
     },
     {
       "id": "analyze_a",
       "agent": "maya",
-      "task": "Analyze experiment A",
-      "depends_on": ["exp_a"],
-      "depends_on_tags": ["metrics:a"]
+      "task": "Analyze experiments A and B",
+      "depends_on": ["exp_a", "exp_b"],
+      "depends_on_tags": ["metrics:a", "metrics:b"]
     }
   ]
 }
@@ -185,11 +202,15 @@ If you need richer dependency structure, use `TASK_GRAPH` with:
 
 - `id`
 - `worker_class` for pooled workers, or `agent` for a specific worker
+- `execution_mode` — `param_patch` (default for hyperparameter changes; runs without a worker LLM via the direct executor) | `code_edit` (worker LLM rewrites code) | `llm_repair` (LLM-driven fix-up of a failed param_patch)
+- when `execution_mode` is `param_patch`, you must provide `edits[]` (one or more of `constant_replace` / `regex_replace` / `block_replace` / `unified_diff`) and you may set `base_ref` (default `HEAD`)
+- `rationale` — short sentence describing what the experiment is testing; surfaced verbatim in the next manager replan's compact ledger so you can pattern-match your own past hypotheses
 - `depends_on`
 - `depends_on_tags`
 - `produces_tags`
 - optional `priority`, `utility`, and `estimated_runtime_seconds`
 - optional `replan_after`
+- optional `early_stop: {check_at_seconds, abort_if_loss_above}` — wrapper-side early-termination on training loss
 
 For GPU experiment queues, prefer `worker_class` so the runtime can dispatch ready tasks to idle worker instances. Keep enough independent ready tasks to fill the available GPU tokens when useful work remains.
 
