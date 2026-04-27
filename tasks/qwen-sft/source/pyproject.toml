@@ -1,0 +1,18 @@
+[project]
+name = "qwen-sft"
+version = "0.1.0"
+description = "Qwen3-4B SFT data-mix search task plugin"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.4",
+  "transformers>=4.46",
+  "datasets>=3.0",
+  "accelerate>=1.0",
+  "numpy>=1.26",
+  "pyarrow>=15.0",
+  "pandas>=2.0",
+  "flash-attn>=2.6",
+]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
