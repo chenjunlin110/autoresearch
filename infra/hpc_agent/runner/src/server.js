@@ -32,6 +32,7 @@ import {
   normalizeDirectExecutorConfig,
   normalizeOrchestrationConfig,
   normalizeScheduleStep,
+  parseKeepExperimentDocument,
   parseKillTasksDocument,
   parseScheduleDocument,
   parseTaskGraphDocument,
@@ -53,6 +54,8 @@ import {
   computeEditConfidence,
   formatLedgerMarkdown,
 } from './experiment-ledger.js';
+import { applyKeepExperiment, formatLineageMarkdown, readLineage } from './lineage.js';
+import { readTaskEvents, taskEventsPath } from './task-events.js';
 import { listSessions as chatListSessions, createSession as chatCreateSession, getSession as chatGetSession, deleteSession as chatDeleteSession, updateSessionPreferences as chatUpdateSessionPreferences, streamChatMessage, getActiveStream, isStreaming as isChatStreaming, saveMessage as chatSaveMessage } from './chat.js';
 import { resolveModel, callModel, buildUserMessage, getModels as getPiModels } from './providers/index.js';
 import { buildCustomTierMap, resolveProviderRuntime } from './providers/custom-config.js';
@@ -1856,6 +1859,51 @@ class ProjectRunner {
       try { log(`Experiment ledger build failed: ${e.message}`, this.id); } catch {}
     }
 
+    // Cumulative-lineage view: which experiments have been KEPT via
+    // `<!-- KEEP_EXPERIMENT -->`, and what is `source/`'s HEAD now? New
+    // `param_patch` tasks with `base_ref: "HEAD"` start from this point,
+    // so the manager needs to see it to plan additive edits.
+    try {
+      const directConfig = config?.directExecutor || null;
+      if (directConfig?.enabled) {
+        const lineage = readLineage(path.join(this.projectDir, 'lineage.json'));
+        const md = formatLineageMarkdown(lineage);
+        if (md) lines.push('', md);
+      }
+    } catch (e) {
+      try { log(`Lineage render failed: ${e.message}`, this.id); } catch {}
+    }
+
+    // Source-file injection: lets the manager actually READ the current
+    // post-keep `train.py` (or whichever files the task plugin lists in
+    // `directExecutor.managerContextFiles`). Closes the "code-reading"
+    // gap that gave Karpathy's serial agent its first big win — the
+    // manager can now propose edits grounded in what's actually in the
+    // file, not just one-line ledger summaries.
+    try {
+      const directConfig = config?.directExecutor || null;
+      const ctxFiles = directConfig?.managerContextFiles || [];
+      if (directConfig?.sourceRepoPath && Array.isArray(ctxFiles) && ctxFiles.length > 0) {
+        for (const rel of ctxFiles) {
+          const abs = path.resolve(directConfig.sourceRepoPath, rel);
+          // Don't escape the source root.
+          if (!abs.startsWith(path.resolve(directConfig.sourceRepoPath) + path.sep)) continue;
+          try {
+            const body = fs.readFileSync(abs, 'utf-8');
+            lines.push('', `> **Current \`source/${rel}\` (HEAD reflects all KEPT experiments):**`);
+            lines.push('```python');
+            lines.push(body);
+            lines.push('```');
+          } catch {
+            // Missing files are silently skipped — they may not exist
+            // before prepare.py has run, etc.
+          }
+        }
+      }
+    } catch (e) {
+      try { log(`Manager context-file injection failed: ${e.message}`, this.id); } catch {}
+    }
+
     return lines.join('\n');
   }
 
@@ -1949,6 +1997,68 @@ class ProjectRunner {
 
   _isTaskGraphPlan(plan) {
     return !!plan && plan._kind === 'task_graph' && Array.isArray(plan._tasks);
+  }
+
+  /**
+   * Handle a `<!-- KEEP_EXPERIMENT -->` block: for each kept entry,
+   * look up the experiment's structured edits in its task-events doc,
+   * re-apply them to the task plugin's source/ via
+   * {@link applyKeepExperiment}, and write a lineage row. Subsequent
+   * `param_patch` tasks with `base_ref: "HEAD"` then start from the
+   * advanced source/ HEAD — the cumulative-branching primitive that
+   * matches Karpathy's serial git-advance loop on top of our parallel
+   * dispatch.
+   *
+   * Returns the number of experiments successfully kept; logs (does
+   * not throw) on per-experiment failures so a single bad keep can't
+   * crash the manager loop.
+   *
+   * @private
+   * @param {Array<{id: string, reason?: string}>} keepEntries
+   * @return {number}
+   */
+  _handleKeepExperiments(keepEntries) {
+    if (!Array.isArray(keepEntries) || keepEntries.length === 0) return 0;
+    const directConfig = this.loadConfig().directExecutor || null;
+    if (!directConfig?.enabled) {
+      log('KEEP_EXPERIMENT ignored: directExecutor not configured for this project', this.id);
+      return 0;
+    }
+    const lineagePath = path.join(this.projectDir, 'lineage.json');
+    let kept = 0;
+    for (const entry of keepEntries) {
+      const taskId = entry.id;
+      const events = readTaskEvents(this.taskEventsDir, taskId);
+      if (!events) {
+        log(`KEEP_EXPERIMENT ${taskId}: no task-events file found`, this.id);
+        continue;
+      }
+      const picked = (events.events || []).find((e) => e.name === 'picked');
+      const edits = picked?.edits;
+      if (!Array.isArray(edits) || edits.length === 0) {
+        log(`KEEP_EXPERIMENT ${taskId}: not a param_patch experiment (no edits in picked event)`, this.id);
+        continue;
+      }
+      const result = applyKeepExperiment({
+        sourceRepoPath: directConfig.sourceRepoPath,
+        lineagePath,
+        taskName: this.id,
+        experimentId: taskId,
+        reason: entry.reason || '',
+        edits,
+      });
+      if (!result.ok) {
+        log(`KEEP_EXPERIMENT ${taskId} failed: ${result.reason}`, this.id);
+        continue;
+      }
+      if (result.alreadyKept) {
+        log(`KEEP_EXPERIMENT ${taskId}: already kept (no-op)`, this.id);
+      } else {
+        log(`KEEP_EXPERIMENT ${taskId}: source/ advanced to ${result.commit.slice(0, 7)}${entry.reason ? ` — ${entry.reason}` : ''}`, this.id);
+        kept += 1;
+      }
+    }
+    return kept;
   }
 
   // Mark a set of task ids as cancelled, abort any active worker LLM runs for
@@ -2270,8 +2380,10 @@ class ProjectRunner {
       });
       const result = await this.runAgent(managerAgent, config, 'single-manager-live-replan', context, { mode: 'full', issues: [] });
       if (!result?.success || !result?.resultText) return { added: 0, skipped: 0, killed: 0, ran: true };
-      // Apply kill requests first so any newly-appended task that depends on
-      // a killed task's tag will be rejected by the merge step.
+      // KEEP first so subsequent edits in the same response see the
+      // updated source/HEAD; then KILL so dependents on killed tags are
+      // rejected by the merge step.
+      this._handleKeepExperiments(parseKeepExperimentDocument(result.resultText));
       const killIds = parseKillTasksDocument(result.resultText);
       const killed = killIds.length ? this._killTaskGraphTasks(plan, killIds) : 0;
       const incoming = this.parseSchedule(result.resultText, {
@@ -2752,9 +2864,10 @@ class ProjectRunner {
       // watermark defaults to 1.5× max workers (12 on an 8-GPU node), so we
       // don't wake the manager until the ready+running depth would force
       // GPUs to sit idle within the next dispatch round.
+      const watermarkRatio = orchestration.liveReplanWatermarkRatio ?? 1.5;
       const watermark = Math.max(
         running.length + 1,
-        Math.ceil((orchestration.maxConcurrentWorkers || 1) * 1.5),
+        Math.ceil((orchestration.maxConcurrentWorkers || 1) * watermarkRatio),
       );
       let readyCount = 0;
       for (const candidate of plan._tasks) {
@@ -2920,6 +3033,10 @@ class ProjectRunner {
           // rationale. Skipped for code_edit / unified_diff (no
           // structured form).
           edit_summary: summarizeEditsForLedger(task.edits),
+          // Raw edits captured here so KEEP_EXPERIMENT can later look
+          // them up by task id and re-apply them to source/. Only
+          // populated for param_patch tasks (others have null).
+          edits: Array.isArray(task.edits) ? task.edits : null,
         });
 
         const launched = await this._startScheduledWorker(task, workers, config, managerName, orchestration, {
@@ -3197,8 +3314,10 @@ class ProjectRunner {
 
       let schedule = null;
       if (result?.resultText) {
-        // Apply manager kill requests against the resumed schedule (if any) before
-        // parsing the new graph, so dependency lineage stays consistent.
+        // Process manager directives in order: KEEP first (advances source/),
+        // then KILL (cancels), then parse the new TASK_GRAPH (which can use
+        // the advanced source/HEAD as base_ref).
+        this._handleKeepExperiments(parseKeepExperimentDocument(result.resultText));
         const killIds = parseKillTasksDocument(result.resultText);
         if (killIds.length && this._isTaskGraphPlan(this.currentSchedule)) {
           this._killTaskGraphTasks(this.currentSchedule, killIds);

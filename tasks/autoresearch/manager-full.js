@@ -226,9 +226,36 @@ If a task is still running and you've already decided its result won't matter (e
 
 The runner will SIGTERM the worker LLM (which takes its bash + train.py descendants with it) and free the GPU token. Don't kill experiments that are about to finish (>80% through the budget); the cost is already paid.
 
-## Keep/discard via git lineage
+## Cumulative lineage via \`KEEP_EXPERIMENT\` (this is your most important primitive)
 
-After each result lands, decide: was this branch's edit a win? If yes, future experiments fork from that branch (set \`base_ref\` to its experiment id). If no, fork from the previous kept parent (skip the dead branch). Don't keep stacking edits on a discarded branch.
+By default every \`param_patch\` task with \`base_ref: "HEAD"\` clones from the **shared baseline** \`source/\`, not from another experiment's branch. To make wins compound, you must explicitly tell the framework which experiments to keep — like Karpathy's serial agent advances its branch on each win:
+
+\`\`\`
+<!-- KEEP_EXPERIMENT -->
+[
+  {"id": "exp_0010_aspect_96", "reason": "aspect=96 beat baseline by -0.0014"},
+  {"id": "exp_0019_compile_on", "reason": "compile=on cut val_bpb by 0.06 vs no-compile baseline"}
+]
+<!-- /KEEP_EXPERIMENT -->
+\`\`\`
+
+What this does:
+1. The framework re-applies that experiment's \`edits[]\` to \`tasks/autoresearch/source/\` and commits.
+2. \`source/\`'s HEAD now reflects the kept change.
+3. Every subsequent \`param_patch\` task with \`base_ref: "HEAD"\` clones from this advanced HEAD — so its edit STACKS on top.
+4. The next manager-context you receive will show a **Kept lineage** section listing every kept experiment and the current source HEAD SHA.
+
+When to KEEP: when an experiment beats your current source HEAD by a margin clearly above noise (rule of thumb: ≥0.001 val_bpb on 5-min training; smaller wins should be re-tested before keeping). Multiple wins along independent axes (e.g., bs↑ and matrix_lr=0.05) can be kept together if both are clear.
+
+When NOT to KEEP: noise-level differences, regressions, crashes, anything you'd describe as "could be the seed".
+
+When to UN-KEEP (rewind): there's no automatic primitive for this — if a kept experiment turns out to have been a fluke, you can effectively rewind by KEEPing the LATER version of that file (i.e., emit a \`code_edit\` task that produces the desired source state and then KEEP it, or just live with the slight regression and find new wins on top).
+
+\`KEEP_EXPERIMENT\` runs **before** any new TASK_GRAPH in the same response is parsed, so you can KEEP an old experiment and immediately emit new tasks that build on it in the same manager response.
+
+## Old "git lineage" advice
+
+Earlier prompts said you could fork from prior winners by setting \`base_ref\` to an experiment id — that does **not** work because per-experiment sandboxes are isolated git clones. Use \`KEEP_EXPERIMENT\` (above) instead. \`base_ref\` should always be \`"HEAD"\` (or omitted; \`HEAD\` is the default).
 
 ## When tasks fail
 
@@ -248,10 +275,12 @@ Why this is non-negotiable: the runtime context you receive next time will repla
 You will be called continuously. Every time the runtime queue runs shallow, the runner calls you again with the latest state. On each call:
 
 1. **Read your past hypotheses next to their results** in the runtime context the runner just gave you (top-K + recent). Look for *patterns*: which axis (depth, aspect, LR, beta_2, attention) actually moved \`val_bpb\`? Which "should have helped" hypothesis didn't? Disqualify dead axes; double down on live ones.
-2. If you need more detail than the ledger one-liners give, read \`${experimentName}/<id>/metrics.json\`, \`failure.json\`, or the per-experiment \`train.py\` (its diff vs the source baseline).
-3. Decide what to try next based on the patterns. **Exploit when you have a winner**: emit a fan-out around that winner's axis (e.g. winner is aspect=96 → try aspect=80, 112, plus aspect=96 combined with the next-best axis). **Explore when nothing's separating from baseline**: shift to a different axis you haven't explored.
-4. Append new tasks to the live TASK_GRAPH. Each task carries a \`rationale\` (see above). Do not repeat existing task ids. New tasks must not depend on still-running task ids or unproduced tags.
-5. Keep around ${experimentsPerWave}-${backlogTarget} ready/pending GPU tasks queued so tokens never sit idle. Better to over-emit than under-emit: extra tasks just queue.
+2. **Read the current \`source/train.py\`** that the runner injected into your context — this reflects all KEPT experiments so far. Compare it against what the ledger says was tried. Is there an obvious next edit you can see in the source (e.g., a default flag like \`AUTORESEARCH_DISABLE_COMPILE="1"\` waiting to be flipped, an obviously suboptimal constant)? Those are often the cheapest wins.
+3. **KEEP clearly-winning experiments** before emitting more tasks. If \`exp_0010\` beat the current source HEAD by a margin above noise, emit a \`<!-- KEEP_EXPERIMENT -->\` block in this same response so the next batch of tasks builds on it.
+4. If you need more detail than the ledger one-liners give, read \`${experimentName}/<id>/metrics.json\`, \`failure.json\`, or the per-experiment \`train.py\` (its diff vs the source baseline).
+5. Decide what to try next based on the patterns. **Exploit when you have a winner**: emit a fan-out around that winner's axis (e.g. winner is aspect=96 → try aspect=80, 112, plus aspect=96 combined with the next-best axis). **Explore when nothing's separating from baseline**: shift to a different axis you haven't explored.
+6. Append new tasks to the live TASK_GRAPH. Each task carries a \`rationale\`. Tasks' \`expected_old_repr\` should match the **current** source/train.py state (which reflects all KEPT experiments) — not the original baseline. Do not repeat existing task ids. New tasks must not depend on still-running task ids or unproduced tags.
+7. Keep around ${experimentsPerWave}-${backlogTarget} ready/pending GPU tasks queued so tokens never sit idle. Better to over-emit than under-emit: extra tasks just queue.
 
 Don't emit \`PROJECT_COMPLETE\`. If you run out of ideas: re-read \`${workloadRoot}/train.py\` for fresh angles, combine previous near-misses, try more radical architecture changes, or read papers referenced in the code.
 
@@ -360,7 +389,11 @@ orchestration:
   maxManagerPasses: 1000000
   refillOnGraphDrain: true
   liveReplanOnTaskComplete: true
-  liveReplanMinIntervalSeconds: 30
+  liveReplanMinIntervalSeconds: 15
+  # Wake the manager whenever ready+running drops below 1.0× max workers
+  # (i.e. on every completion). Pairs with KEEP_EXPERIMENT lineage so the
+  # manager can act on each result individually instead of batching feedback.
+  liveReplanWatermarkRatio: 1.0
   targetGpuUtilization: 1
   defaultWorkerResources:
     gpus: 0
@@ -399,6 +432,7 @@ function renderDirectExecutorBlock({
   sharedCacheRoot = null,
   timeBudgetSeconds = 300,
   hardCapSeconds = 900,
+  contextFiles = ['train.py'],
 }) {
   const envEntries = [];
   if (resultsPath) envEntries.push(`    AUTORESEARCH_RESULTS_PATH: ${resultsPath}`);
@@ -406,6 +440,10 @@ function renderDirectExecutorBlock({
   const envLines = envEntries.length
     ? `  envOverrides:\n${envEntries.join('\n')}\n`
     : '';
+  const ctxLines = (contextFiles || [])
+    .map((f) => `    - ${f}`)
+    .join('\n');
+  const ctxBlock = ctxLines ? `  managerContextFiles:\n${ctxLines}\n` : '';
   return `directExecutor:
   enabled: true
   sourceRepoPath: ${sourceRepoPath}
@@ -415,7 +453,7 @@ function renderDirectExecutorBlock({
   metricKey: val_bpb
   timeBudgetSeconds: ${timeBudgetSeconds}
   hardCapSeconds: ${hardCapSeconds}
-${envLines}`;
+${envLines}${ctxBlock}`;
 }
 
 export function renderProjectsYaml({ projectId, repoRoot, dataDir = null }) {

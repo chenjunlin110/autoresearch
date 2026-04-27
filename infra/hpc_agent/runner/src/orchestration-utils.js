@@ -12,6 +12,7 @@ const DEFAULT_ORCHESTRATION = Object.freeze({
   refillOnGraphDrain: true,
   liveReplanOnTaskComplete: false,
   liveReplanMinIntervalSeconds: 0,
+  liveReplanWatermarkRatio: 1.5,
   targetGpuUtilization: 1,
   defaultWorkerResources: DEFAULT_WORKER_RESOURCES,
 });
@@ -219,6 +220,17 @@ export function normalizeDirectExecutorConfig(input) {
           .map(([key, value]) => [key, String(value)]),
       )
     : {};
+  // Files in source/ to inject into the manager's per-cycle context.
+  // Lets the manager actually read the *current* (post-KEEP_EXPERIMENT)
+  // train.py instead of just one-line ledger summaries — closes the
+  // "code-reading" gap that gave Karpathy's serial agent its first
+  // big win in our verification run.
+  let contextFiles = [];
+  if (Array.isArray(source.managerContextFiles)) {
+    contextFiles = source.managerContextFiles
+      .filter((entry) => typeof entry === 'string' && entry.trim())
+      .map((entry) => entry.trim());
+  }
   return {
     enabled: true,
     sourceRepoPath: source.sourceRepoPath.trim(),
@@ -230,6 +242,7 @@ export function normalizeDirectExecutorConfig(input) {
     timeBudgetSeconds: coercePositiveInteger(source.timeBudgetSeconds, 300),
     hardCapSeconds: coercePositiveInteger(source.hardCapSeconds, 900),
     envOverrides: env,
+    managerContextFiles: contextFiles,
   };
 }
 
@@ -262,6 +275,11 @@ export function normalizeOrchestrationConfig(input = {}) {
     refillOnGraphDrain: coerceBoolean(source.refillOnGraphDrain, DEFAULT_ORCHESTRATION.refillOnGraphDrain),
     liveReplanOnTaskComplete: coerceBoolean(source.liveReplanOnTaskComplete, DEFAULT_ORCHESTRATION.liveReplanOnTaskComplete),
     liveReplanMinIntervalSeconds: coerceNonNegativeInteger(source.liveReplanMinIntervalSeconds, DEFAULT_ORCHESTRATION.liveReplanMinIntervalSeconds),
+    // 1.5× by default holds the manager back so it sees waves of results;
+    // tasks that benefit from per-result feedback (small effect sizes,
+    // depth-of-iteration > breadth) can drop this to 1.0× to wake the
+    // manager on every completion.
+    liveReplanWatermarkRatio: coerceNonNegativeFloat(source.liveReplanWatermarkRatio, DEFAULT_ORCHESTRATION.liveReplanWatermarkRatio),
     targetGpuUtilization: Math.min(1, coerceNonNegativeFloat(source.targetGpuUtilization, DEFAULT_ORCHESTRATION.targetGpuUtilization)),
     defaultWorkerResources: normalizeWorkerResources(source.defaultWorkerResources, DEFAULT_WORKER_RESOURCES),
   };
@@ -314,6 +332,43 @@ export function parseKillTasksDocument(resultText) {
     if (id) seen.add(id);
   }
   return [...seen];
+}
+
+/**
+ * Parse a `<!-- KEEP_EXPERIMENT --> [{"id": "...", "reason": "..."}] <!-- /KEEP_EXPERIMENT -->`
+ * block from the manager's output. Each kept entry tells the framework to
+ * fast-forward `tasks/<task>/source/`'s HEAD to the named experiment's
+ * commit, so subsequent `param_patch` tasks with `base_ref: "HEAD"`
+ * inherit its edits cumulatively (Karpathy-style branch advancing on top
+ * of our parallel dispatch).
+ *
+ * Accepts either an array of objects `[{"id": "...", "reason": "..."}]`
+ * or an array of bare strings `["exp_0010", ...]` (rationale logged
+ * empty in the latter form). Forgiving on parse — missing block returns
+ * `[]`, malformed JSON returns `[]`.
+ *
+ * @param {string|null|undefined} resultText
+ * @return {Array<{id: string, reason: string}>}
+ */
+export function parseKeepExperimentDocument(resultText) {
+  const match = String(resultText || '').match(/<!--\s*KEEP_EXPERIMENT\s*-->\s*(\[[\s\S]*?\])\s*<!--\s*\/KEEP_EXPERIMENT\s*-->/);
+  if (!match) return [];
+  let raw;
+  try { raw = JSON.parse(match[1]); } catch { return []; }
+  if (!Array.isArray(raw)) return [];
+  const seen = new Map();
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      const id = item.trim();
+      if (id && !seen.has(id)) seen.set(id, { id, reason: '' });
+    } else if (item && typeof item === 'object' && !Array.isArray(item)) {
+      const id = typeof item.id === 'string' ? item.id.trim() : '';
+      if (!id) continue;
+      const reason = typeof item.reason === 'string' ? item.reason.trim() : '';
+      if (!seen.has(id)) seen.set(id, { id, reason });
+    }
+  }
+  return [...seen.values()];
 }
 
 export function parseScheduleDocument(resultText, defaultWorkerResources = DEFAULT_WORKER_RESOURCES) {

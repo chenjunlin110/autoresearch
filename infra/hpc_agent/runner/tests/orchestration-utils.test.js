@@ -7,6 +7,7 @@ import {
   computeTaskGraphCriticalPathScores,
   normalizeOrchestrationConfig,
   normalizeScheduleStep,
+  parseKeepExperimentDocument,
   parseKillTasksDocument,
   parseScheduleDocument,
   parseTaskGraphDocument,
@@ -359,6 +360,35 @@ test('buildManagedWorkerTask prepends grant instructions', () => {
   assert.match(task, /do not use srun, HpcSubmit, or any cross-node attach/);
   assert.match(task, /use that exact directory/);
   assert.match(task, /Run the training job/);
+});
+
+test('parseKeepExperimentDocument: object form with reason', () => {
+  const text = '<!-- KEEP_EXPERIMENT -->'
+    + '[{"id":"exp_0010","reason":"aspect=96 -0.0014"},'
+    + ' {"id":"exp_0019","reason":"compile on -0.06"}]'
+    + '<!-- /KEEP_EXPERIMENT -->';
+  assert.deepEqual(parseKeepExperimentDocument(text), [
+    { id: 'exp_0010', reason: 'aspect=96 -0.0014' },
+    { id: 'exp_0019', reason: 'compile on -0.06' },
+  ]);
+});
+
+test('parseKeepExperimentDocument: bare-string form (reason empty)', () => {
+  const text = '<!-- KEEP_EXPERIMENT --> ["exp_a", " exp_b "] <!-- /KEEP_EXPERIMENT -->';
+  assert.deepEqual(parseKeepExperimentDocument(text), [
+    { id: 'exp_a', reason: '' },
+    { id: 'exp_b', reason: '' },
+  ]);
+});
+
+test('parseKeepExperimentDocument: dedups and tolerates missing block / bad JSON', () => {
+  // duplicate id keeps only the first entry
+  const dup = '<!-- KEEP_EXPERIMENT -->[{"id":"exp_a","reason":"first"},{"id":"exp_a","reason":"second"}]<!-- /KEEP_EXPERIMENT -->';
+  assert.deepEqual(parseKeepExperimentDocument(dup), [{ id: 'exp_a', reason: 'first' }]);
+  // missing block / bad JSON / non-array all return []
+  assert.deepEqual(parseKeepExperimentDocument('no block here'), []);
+  assert.deepEqual(parseKeepExperimentDocument('<!-- KEEP_EXPERIMENT -->{not array}<!-- /KEEP_EXPERIMENT -->'), []);
+  assert.deepEqual(parseKeepExperimentDocument('<!-- KEEP_EXPERIMENT -->[oops<!-- /KEEP_EXPERIMENT -->'), []);
 });
 
 test('parseKillTasksDocument extracts ids and is forgiving', () => {
