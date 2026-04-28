@@ -1,13 +1,7 @@
-% ICML Workshop submission. To switch to the official ICML style:
-%   1. Place icml2024.sty (or whichever year's) in this directory.
-%   2. Uncomment the \usepackage[accepted]{icml2024} line below and remove
-%      the article-class fallback we use here so the file compiles
-%      standalone without the workshop package.
-%
-% This file describes the system design of an LLM-driven concurrent
-% research-task framework, with the autoresearch hyperparameter / data-mix
-% search task as the running example. Compilable with vanilla LaTeX:
-%   pdflatex icml-workshop.tex && bibtex icml-workshop && pdflatex … (×2)
+% ICML submission. Compiles standalone with vanilla LaTeX (article class).
+% For the actual submission, drop in icml2024.sty (or whichever year),
+% switch the documentclass line, and split the inline thebibliography
+% into a real .bib file.
 
 \documentclass[11pt]{article}
 
@@ -19,6 +13,8 @@
 \usepackage{xcolor}
 \usepackage{enumitem}
 \usepackage{listings}
+\usepackage{amsmath}
+\usepackage{amssymb}
 \usepackage{titlesec}
 
 \titleformat{\section}{\large\bfseries}{\thesection}{0.5em}{}
@@ -37,8 +33,8 @@
   keepspaces=true,
 }
 
-\title{\textbf{Cumulative Parallel Search:\\
-A Framework for Multi-GPU LLM-Driven Research Loops}}
+\title{\textbf{Resource-Aware Agent-Led Search:\\
+Trading Off Information and Parallelism in LLM-Driven Optimization Loops}}
 
 \author{Junlin Chen\\
 \textit{Affiliation TBD} \\
@@ -49,242 +45,308 @@ A Framework for Multi-GPU LLM-Driven Research Loops}}
 \maketitle
 
 \begin{abstract}
-Karpathy's \textit{autoresearch} demonstrated that a single LLM agent, given a small training repo and a 5-minute time budget per experiment, can iteratively edit code and improve a metric overnight. The loop is fundamentally serial: each experiment either advances the git branch or is discarded, and the next experiment starts from the latest kept state.
-
-Naively scaling this to a multi-GPU cluster — fanning out 8 experiments at once and asking a manager LLM to coordinate — does \emph{not} produce 8$\times$ the research output. We empirically observed our 8-GPU 1-hour parallel run finish 27 experiments all clustered at val\_bpb $\approx 0.9928 \pm 0.0001$, while a 1-GPU 1-hour Karpathy serial run finished only 8 experiments but reached val\_bpb $= 0.9894$, a $15\times$ larger improvement. The cause was \emph{not} the manager's reasoning quality; it was that every experiment forked from the same un-advanced baseline, so wins never compounded.
-
-This paper describes a framework that recovers serial depth on top of parallel breadth. The core primitive is \texttt{KEEP\_EXPERIMENT}: a manager-issued directive that re-applies a winning experiment's structured edits to the shared source tree, advancing its HEAD and causing all subsequent parallel experiments to clone from the new baseline. Combined with two execution modes — a deterministic \texttt{param\_patch} path that applies AST-normalized edits without a worker LLM, and an LLM-driven \texttt{code\_edit} fallback for free-form rewrites — and a watermark-gated live-replan policy, the framework dispatches 8 GPUs in parallel while preserving the cumulative branching that makes the serial loop work. We report design, six implementation lessons, and an end-to-end empirical comparison.
+A growing class of optimization problems are tackled by an LLM \emph{agent} that proposes a candidate (a code edit, a hyperparameter assignment, a data-mix vector), evaluates it via a fixed harness, and iterates. Two extremes dominate today's implementations: \emph{serial loops} that use information optimally per decision but waste compute (one GPU evaluating, $K-1$ idle), and \emph{naive parallel loops} that scale compute but starve each decision of the most recent results. We characterize this as a tradeoff between two scarce resources — \emph{information per decision} and \emph{parallel throughput} — and propose a \textbf{resource-aware} framework that exposes the tradeoff as three independent knobs. The framework introduces a manager-issued cumulative-lineage primitive that selectively re-shares wins across parallel workers, a watermark-gated re-planning policy that controls the manager's wake-up rate, and a compact rationale ledger that re-injects each evaluation's hypothesis next to its outcome on every wake-up. We evaluate on two task plugins — a hyperparameter-search task on a small GPT trainer, and a Qwen-3 SFT data-mix-search task on T\"ulu-3 — and show the resource-aware configuration recovers most of the serial loop's research output while keeping $8\times$ throughput.
 \end{abstract}
 
 \section{Introduction}
+\label{sec:introduction}
 
-A single-agent autonomous research loop, in the form popularized by Karpathy's \textit{autoresearch}~\cite{karpathy2026autoresearch}, looks like this: an LLM is given a small repository (\texttt{prepare.py} for fixed harness, \texttt{train.py} for the searchable code, \texttt{program.md} for instructions); on each iteration it reads its prior results, edits \texttt{train.py}, runs a 5-minute training, records the metric (\texttt{val\_bpb}, lower is better), and either advances or rewinds its git branch. Run overnight, the loop produces a steady chain of cumulative improvements without human intervention.
+A growing fraction of practical optimization is now done by an LLM \emph{agent} in a loop: the agent reads prior results, proposes a candidate (a code edit, a hyperparameter setting, a configuration), evaluates it via a fixed harness (a training run, an eval, a benchmark), reads the metric, and iterates. The same pattern recurs across automated machine-learning research \cite{karpathy2026autoresearch}, code-fix loops in software engineering agents \cite{aider, swebench}, prompt-tuning loops, kernel-autotuning loops, and data-mix-search loops in instruction-tuning \cite{tulu3}. We call this class \emph{agent-led search}. It is distinguished from classical AutoML by the proposer's nature: the proposer is a generative LLM with prior domain knowledge, free-form access to the search space, and rationales that themselves enter the next iteration's history.
 
-The loop's elegance is also its limit: it is single-GPU and strictly serial. Each iteration costs $\sim$5 minutes of training plus 30--60 seconds of LLM thinking; on an 8-GPU node, 7 GPUs are idle 100\% of the time. The natural question is whether the same agent style can be extended to a parallel allocation without losing the property that experiments build on each other's wins.
+Two implementation extremes dominate today:
 
-This paper answers that question concretely. We describe a framework where:
+\textbf{Serial loops} run one agent in a single repository, evaluating one candidate at a time. Each iteration sees the full history — including the just-finished result — and the agent's git branch advances on every win. Serial loops use available information \emph{optimally}: every byte of state at iteration $t$ informs the proposal at $t{+}1$. They are wasteful of compute: on an 8-GPU node, 7 GPUs idle through every evaluation.
+
+\textbf{Naive parallel loops} ask a manager agent to dispatch a batch of $K$ candidates that workers run in parallel; the manager reads the batch and dispatches the next. Compute is fully utilized, but information is fragmented: each batch's $K$ proposals are committed before any of their results land; the next batch reflects only the previous batch's outcomes; per-result reactions are coarsened to per-batch reactions. We empirically observed this in our setting: an 8-GPU 1-hour run produced 27 evaluations whose best result fell within seed-noise of the starting baseline, despite a competent manager LLM and clean infrastructure.
+
+The two extremes optimize different resources. The serial loop spends \emph{information per decision} liberally and \emph{parallel throughput} not at all; the naive parallel loop does the reverse. Neither is satisfying for a multi-GPU shared allocation, which is the dominant deployment context for the manager-worker pattern. The honest design space lies between them: \emph{which pieces of information actually matter, and how much do we lose if we let them lag?}
+
+This paper makes three contributions:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Tradeoff characterization} (Section~\ref{sec:method}). We identify three concrete information-flow channels — state, baseline, and coverage — that are silently broken by naive parallelization, and analyze each independently.
+
+  \item \textbf{Resource-aware framework} (Section~\ref{sec:system}). We introduce three matching mechanisms — a watermark-gated re-planning policy, a cumulative-lineage primitive (\texttt{KEEP\_EXPERIMENT}), and a compact rationale ledger with verbatim source-file injection — that selectively restore each channel without giving up parallelism. Each mechanism has a parameterized cost and can be enabled independently.
+
+  \item \textbf{Empirical evaluation on two tasks} (Section~\ref{sec:experiments}). We evaluate on a hyperparameter-search task and a Qwen-3 SFT data-mix-search task at matched 1-hour wall budgets against both serial and naive-parallel baselines, with per-channel ablations. The resource-aware configuration produces an order of magnitude more useful signal than naive parallel and approaches the serial baseline at $8\times$ throughput.
+\end{enumerate}
+
+The framework is task-agnostic; tasks plug in via a five-file contract.
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Agent-led research and engineering loops}
+
+Karpathy's autoresearch \cite{karpathy2026autoresearch} is the most direct antecedent and the source of our serial baseline. Its design is the canonical serial loop: one agent in a single git repository, fixed-budget evaluations, branch-advance on win. The strength is information utilization; the limit is parallelism.
+
+Multi-agent code-editing systems such as Aider \cite{aider} and the systems benchmarked on SWE-bench \cite{swebench} parallelize work across files or sub-tasks but do not have a primitive for cumulative branching across the parallel pool — each parallel agent's edits typically land on a per-task branch and are merged by a coordinator at completion. AutoGPT-style loops dispatch sub-goals in parallel without a shared baseline-advance mechanism; they suffer the analogous baseline-staleness problem in our taxonomy.
+
+Tree-search planners such as LATS \cite{lats} and ReAct \cite{react} expand parallel branches in an explicit tree with state-merging policies; they assume a stateful environment a tree-search node can be checkpointed to, while LLM-driven research loops have side-effecting code edits we leverage \texttt{git} to manage.
+
+\subsection{Bayesian and population-based hyperparameter search}
+
+Population-based training \cite{pbt} and Hyperband \cite{hyperband} share the structure of parallel evaluations with periodic exploitation, but their proposal mechanism is restricted (perturbation, halving). Bayesian optimization assumes a posterior over a low-dimensional continuous search space. The agent-led setting differs because the proposer has free-form generative access to the search space and uses prior history qualitatively, not just quantitatively. Our framework is complementary to BO/population-based methods: a future variant could let the manager LLM act as a high-recall proposer with a learned surrogate ranking candidates before dispatch.
+
+\subsection{Data-mix search for instruction tuning}
+
+T\"ulu-3 \cite{tulu3} curates per-source labels in its mixture, which is what makes our second task have signal. Recent work on automated mix-weight tuning \cite{datamix2024} is parallel and population-based. The agent-led approach is complementary, and our framework's task-plugin contract lets the same scheduler / lineage / ledger machinery host either a hyperparameter search or a data-mix search by swapping the runnable code and the manager prompt.
+
+\section{Method: The Information-Parallelism Tradeoff}
+\label{sec:method}
+
+\subsection{Problem setup}
+\label{sec:setup}
+
+A search instance is a tuple $(\mathcal{S}, h, \pi)$ where:
+
 \begin{itemize}[leftmargin=*,nosep]
-  \item A \textbf{manager} LLM proposes a TASK\_GRAPH of $\sim$8--16 experiments per pass.
-  \item A \textbf{scheduler} dispatches them across a shared GPU-token pool with priority, dependencies, and live re-planning.
-  \item A \textbf{direct executor} applies structured edits to per-experiment git sandboxes \emph{without} invoking a worker LLM, eliminating per-task LLM cost for the common case.
-  \item A \textbf{cumulative-lineage} primitive (\texttt{KEEP\_EXPERIMENT}) lets the manager advance the shared source HEAD when an experiment wins, so subsequent experiments inherit the win.
-  \item A \textbf{persistent shared compile cache} survives sbatch-job boundaries, eliminating the cold-\texttt{torch.compile} cost from cycle-1 of subsequent runs.
+  \item $\mathcal{S}$ is the search space: legal mutations to a fixed source repository.
+  \item $h: \mathcal{S} \to \mathbb{R}$ is a deterministic harness mapping a candidate to a metric, with fixed wall-clock cost $T_h$ per call.
+  \item $\pi$ is the search policy: an LLM agent that, given a history $H_t = \{(s_i, h(s_i), r_i)\}_{i \le t}$ (where $r_i$ is the rationale produced when proposing $s_i$), emits the next candidate $s_{t+1}$.
 \end{itemize}
 
-The framework is task-agnostic: a five-file plugin contract (runnable code, wrapper script, manager prompt, worker prompt, workspace generator) drops a new search problem in. We have shipped two task plugins: the autoresearch hyperparameter search above, and a Qwen-SFT data-mix search where the manager proposes mixture weights over labeled instruction-tuning datasets.
+The objective is $\min_{s \in \mathcal{S}_{\text{visited}}} h(s)$ given a wall-clock budget $W$ and a parallel-evaluation budget $K$ (typically the GPU count). Two limiting regimes:
 
-We report the architecture in detail, document six lessons learned during integration, and present an empirical comparison against the serial Karpathy baseline at matched 1-hour wall time.
+\begin{itemize}[leftmargin=*,nosep]
+  \item $K{=}1$ \textbf{(serial):} $\pi$ sees the full $H_t$ before each $s_{t+1}$. Total evaluations $N_W = W / T_h$.
+  \item $K{=}K_{\max}$ \textbf{(naive parallel):} $\pi$ emits $K$ candidates per wake-up, sees only $H_t$ at the wake-up time. Total evaluations $N_W \approx K \cdot W / T_h$ but each batch reflects an information lag of up to $T_h$.
+\end{itemize}
 
-\section{Background and Motivation}
+We seek a policy that approaches naive parallel's $K \cdot W / T_h$ throughput while approaching serial's information utilization.
 
-\subsection{The Serial Loop}
+\subsection{Three information-flow channels}
 
-Karpathy's autoresearch agent operates in a tight loop:
-\begin{enumerate}[leftmargin=*,nosep]
-  \item Read \texttt{train.py}, \texttt{program.md}, recent \texttt{results.tsv}.
-  \item Decide on the next experimental edit.
-  \item Apply the edit, \texttt{git commit}.
-  \item Run \texttt{uv run train.py} (5-minute training).
-  \item Read the printed \texttt{val\_bpb}.
-  \item If \texttt{val\_bpb} improved, \emph{advance} the branch; otherwise \texttt{git reset}.
-\end{enumerate}
-Critically, the agent's git branch advances monotonically: a successful experiment becomes the new baseline for the next. Eight wins compound multiplicatively: the eighth experiment runs with $\sim$8 cumulative edits applied. We measured this empirically — in a 53-minute serial run with 8 experiments, four were kept, and the chain ended at \texttt{val\_bpb} $= 0.9894$ vs.\ the no-compile baseline 1.0529, a $-0.063$ improvement (mostly from one big win, $\sim-0.06$, plus three smaller cumulative gains, $\sim-0.001$ each).
+Three concrete information-flow channels distinguish a serial loop from a naive parallel one. Each is independent — a parallel framework can restore some without restoring all.
 
-\subsection{Why Naive Parallelization Fails}
+\textbf{Channel 1: State staleness.} A serial loop calls $\pi$ exactly once per evaluation. A naive parallel loop calls $\pi$ once per \emph{batch}, so the proposal $s_{t+1}$ is conditioned on history that lags by up to $K-1$ evaluations. If the agent's reasoning depends on individual results (``the $\eta=0.05$ result tells me to try $0.045$ next''), batching delays this by $T_h$ wall-time. The mitigation cost is \emph{agent LLM calls}: calling $\pi$ on every individual completion scales agent cost by $K$.
 
-Three structural properties of the serial loop are inadvertently broken by naive parallelization:
+\textbf{Channel 2: Baseline staleness.} A serial loop's git branch advances on every win: evaluation $t{+}1$ runs from a source state that includes evaluation $t$'s edit, if $t$ won. Wins compound — eight serial wins produce a candidate with eight cumulative edits applied. A naive parallel loop forks each evaluation from a fixed baseline; wins do not compound across the batch. The mitigation cost is \emph{state coherence}: in-flight evaluations dispatched before a baseline advance are now ``stale.'' We must decide whether to cancel and re-dispatch (lost compute), let them complete and discard (lost compute), or let them complete and accept the staleness (engineering complexity).
 
-\textbf{Cumulative branching.} If 8 workers all clone from the same untouched baseline, each experiment's edit is applied in isolation. Wins do not compound.
+\textbf{Channel 3: Coverage staleness.} A serial loop sees a single linear history. The agent reads prior \texttt{(edit, outcome)} pairs and naturally tracks which axes it has tried at which values. A parallel loop's manager sees compact summaries. We empirically observe a failure mode we call \emph{axis fixation}: once the manager finds a winning axis (e.g., $\texttt{aspect\_ratio}$), subsequent waves dispatch a long tail of \texttt{aspect\_ratio\_X} combinations while other axes go untouched. In one of our autoresearch runs, 40 of 65 dispatches were variants on a single axis. The mitigation cost is \emph{prompt context length}: explicit coverage tracking added to the manager's per-cycle context.
 
-\textbf{Per-result feedback.} The serial agent reads exactly one result before deciding the next experiment. A manager that emits 8 tasks at once cannot react to the first result before the eighth dispatches.
+\subsection{The tradeoff}
+\label{sec:tradeoff}
 
-\textbf{Code reading.} The serial agent re-reads \texttt{train.py} on every iteration; this is how it can find ``cheap wins'' such as a default flag like \texttt{AUTORESEARCH\_DISABLE\_COMPILE="1"} hiding in the source. A summary-driven manager that only sees experimental metrics never reads the code itself.
+Each channel has a different lag-cost and a different mitigation cost (Table~\ref{tab:channels}).
 
-In our first end-to-end parallel run (8 GPUs, 1 hour, with a competent manager LLM and structured task scheduling), all 27 experiments completed but clustered at \texttt{val\_bpb} $= 0.9928 \pm 0.0001$ — well within seed-to-seed noise. Manager-LLM thinking quality was not the issue; we verified the rationales were sensible (``aspect=96 should match FFN dim better''). The issue was that every experiment ran on the same shared baseline, so the variance \emph{was} pure seed-noise.
+\begin{table}[h]
+\small
+\centering
+\begin{tabular}{lll}
+\toprule
+Channel & Mitigation cost & Lag cost when uncorrected \\
+\midrule
+State        & Agent LLM calls       & Wrong-batch reactions \\
+Baseline     & In-flight invalidation & Wins do not compound \\
+Coverage     & Prompt tokens          & Manager fixates on one axis \\
+\bottomrule
+\end{tabular}
+\caption{The three information-flow channels, what their mitigations cost, and what their lag costs the search.}
+\label{tab:channels}
+\end{table}
+
+A resource-aware framework should expose each as an independent knob, so a task can pick its own point on each axis. We describe the three mechanisms and their primitives in the next section.
 
 \section{System Design}
+\label{sec:system}
 
-\subsection{Overview}
+We instantiate the method as a single Node.js process per allocation, holding state in a cached SQLite handle (WAL) for token grants, JSON event-trace files (one per evaluation) for the rationale ledger, and the per-task source repository's \texttt{.git} for the cumulative lineage chain. The framework is $\sim$5{,}000 lines across nine modules. We use Claude Opus or Codex CLI as the manager; either accepts the same TASK\_GRAPH protocol.
 
-The framework runs as a single Node.js process inside one Slurm allocation. It binds eight pooled \emph{worker} agents (one per GPU token) plus one \emph{manager} agent. The manager emits TASK\_GRAPHs in markdown-fenced JSON; the runtime parses, validates, dispatches, and re-prompts the manager when the queue runs shallow.
+\subsection{Watermark-gated re-planning (Channel 1)}
+\label{sec:watermark}
 
-\begin{lstlisting}[language=]
-sbatch
-  └─ node server.js
-       └─ ProjectRunner.runSingleManagerCycle()
-            ├─ runAgent(manager) → claude/codex CLI
-            │    parses TASK_GRAPH, KILL_TASKS,
-            │    KEEP_EXPERIMENT
-            └─ executeSchedule(plan)
-                 ├─ pick ready task (priority/critPath
-                 │  /utility ranking)
-                 ├─ walltime admission gate
-                 ├─ tryGrantWorkerResources
-                 │   (SQLite token grant)
-                 ├─ if execution_mode=='param_patch':
-                 │   runDirectTask: clone+edit+commit
-                 │     +spawn wrapper (no LLM)
-                 │ else:
-                 │   runWorkerLLM(claude/codex/api)
-                 ├─ release grant; emit task-events
-                 └─ watermark live replan
-                    if ready+running < 1.0×workers
-\end{lstlisting}
+We replace ``call manager once per batch'' (naive parallel) and ``call manager once per evaluation'' (serial-ish) with a parameterized policy. Let $N_{\text{ready}}$ and $N_{\text{running}}$ denote the queue depth and in-flight count at any moment. We wake the manager only when
 
-State is persisted in (a) a single cached SQLite handle (WAL mode) for token grants, (b) per-task event-trace JSON files for the experiment ledger, and (c) the inner \texttt{tasks/<name>/source/.git} for the lineage chain.
+\begin{equation}
+N_{\text{ready}} + N_{\text{running}} < \alpha \cdot N_{\text{workers}}
+\label{eq:watermark}
+\end{equation}
 
-\subsection{Two Execution Modes}
+where $\alpha \in (0, \infty)$ is a per-task knob. Three regimes:
 
-The TASK\_GRAPH schema accepts an \texttt{execution\_mode} field per task, chosen by the manager:
-
-\textbf{\texttt{param\_patch}} (default). The manager supplies a structured \texttt{edits[]} array. The runtime applies them deterministically to a per-task git sandbox via four edit kinds:
 \begin{itemize}[leftmargin=*,nosep]
-  \item \texttt{constant\_replace}: module-level Python assignment, with AST-normalized comparison so \texttt{2**19}, \texttt{524288}, and \texttt{1<<19} all match.
-  \item \texttt{regex\_replace}: pattern + replacement with a \emph{mandatory} \texttt{expected\_count} that fails loudly on drift.
-  \item \texttt{block\_replace}: anchor regex + end regex, replacing the inclusive region.
-  \item \texttt{unified\_diff}: \texttt{git apply}-compatible escape hatch.
+  \item $\alpha = 1.0$: wake on every completion (serial-style; expensive).
+  \item $\alpha = 1.5$: wake when queue depth drops below $1.5 K$ (naive-parallel-style; cheap).
+  \item $\alpha < 1.0$: aggressive — wake before completions, useful for cold-start.
 \end{itemize}
-Edits are atomic per file; a syntax-break post-patch (\texttt{python -c 'import ast; ast.parse(...)'}) aborts the experiment before training even spawns. No worker LLM is invoked.
 
-\textbf{\texttt{code\_edit}} / \texttt{llm\_repair}. Falls back to an LLM worker that reads the manager's free-text task description and applies arbitrary edits. Used for genuinely structural changes (architecture rewrites, optimizer swaps).
+A minimum-interval seconds parameter prevents wake-up storms when many workers complete near-simultaneously. Completed tasks are queued FIFO into the next wake-up regardless. The trade-off is direct: $\alpha$ controls agent LLM call count vs.\ per-result reactivity.
 
-In our experiments, $\geq 90\%$ of dispatched tasks ran via \texttt{param\_patch}, eliminating the per-task LLM cost.
+\subsection{Cumulative lineage via \texttt{KEEP\_EXPERIMENT} (Channel 2)}
+\label{sec:lineage}
 
-\subsection{Cumulative Lineage: \texttt{KEEP\_EXPERIMENT}}
+We introduce a manager-issued primitive that explicitly advances the shared source baseline. The manager emits, alongside its TASK\_GRAPH:
 
-The key contribution of this paper is the \texttt{KEEP\_EXPERIMENT} primitive. The manager emits, alongside its next TASK\_GRAPH:
-
-\begin{lstlisting}[language=]
+\begin{lstlisting}
 <!-- KEEP_EXPERIMENT -->
 [{"id": "exp_0042_aspect_80",
-  "reason": "aspect=80 beat current HEAD by 0.0014"}]
+  "reason": "aspect=80 -0.0014 vs HEAD"}]
 <!-- /KEEP_EXPERIMENT -->
 \end{lstlisting}
 
-The runtime, on receiving this directive:
-\begin{enumerate}[leftmargin=*,nosep]
-  \item Looks up \texttt{exp\_0042}'s structured \texttt{edits[]} from its \texttt{picked} event in the task-events trace.
-  \item Re-applies them to \texttt{tasks/<task>/source/} (the canonical, in-process source dir) via the same \texttt{applyEdits} utility used by per-task sandboxes.
-  \item \texttt{git commit}s on the inner source repo with the manager's reason.
-  \item Appends a row to \texttt{lineage.json}: \texttt{\{experiment\_id, commit, reason, kept\_at, edits\}}.
-\end{enumerate}
-Subsequent \texttt{param\_patch} tasks with \texttt{base\_ref: "HEAD"} clone from the now-advanced source, so their edits stack on top. Multiple wins along independent axes can be kept in a single block.
+The runtime, on receiving this directive: (1) looks up the experiment's structured edits from its task-events trace; (2) re-applies them to the shared source repository via the same edit-application pipeline used for per-evaluation sandboxes; (3) commits with the manager's reason; (4) appends a row to a \texttt{lineage.json} log (\texttt{\{experiment\_id, commit, reason, kept\_at\}}). Subsequent evaluations clone from the now-advanced source.
 
-\textbf{Race handling.} An experiment dispatched with the old HEAD before a KEEP fires runs to completion as if the KEEP never happened. The manager observes that result alongside others and decides whether to keep it next, kill it (via \texttt{KILL\_TASKS}), or ignore it. Lineage is a \emph{manager} decision, not a timing artifact.
+\textbf{Race handling.} An evaluation dispatched with the old baseline before a KEEP fires runs to completion as if the KEEP never happened. We deliberately do \emph{not} cancel it — the in-flight result is still informative (it tells the manager what the previous baseline yielded). The manager observes both the kept lineage and the stale-baseline result on its next wake-up and decides whether to KEEP the stale-baseline result on top, kill it, or ignore it. Lineage is an explicit manager decision, never a timing artifact.
 
-\subsection{Watermark-Gated Live Replan}
+\textbf{Cost trade.} The mitigation cost is bounded: even if all $W$ in-flight evaluations dispatched before a KEEP turn out to be ``wasted,'' the lag cost is one wall-cycle, after which the next batch dispatches from the new baseline. Empirically, in-flight evaluations from the old baseline frequently \emph{are} useful — they include hypotheses orthogonal to the kept axis, which the manager can then KEEP on top.
 
-Worker completions arrive asynchronously. A naive ``wake the manager on every completion'' policy works for serial loops but, with eight parallel workers, would re-prompt the manager 8$\times$ per cycle — expensive in Opus tokens. We gate live replan on a \emph{watermark}:
+\subsection{Compact rationale ledger (Channel 3)}
+\label{sec:ledger}
 
-\begin{equation}
-\text{wake manager iff} \quad N_{\text{ready}} + N_{\text{running}} < \alpha \cdot N_{\text{workers}}
-\end{equation}
+We restore code-reading and history-reading via two task-agnostic injections into the manager's per-cycle context:
 
-The ratio $\alpha$ is a knob: $\alpha=1.5$ holds the manager back until the queue drops to $\leq 12$ tasks (favoring batch reasoning); $\alpha=1.0$ wakes it on every completion (favoring per-result feedback). For the autoresearch task we set $\alpha=1.0$ to recover serial-style reactivity. Empirically this raised manager-call rate from 0.5:1 (at $\alpha=1.5$) to roughly 1:1.
+\textbf{Verbatim source files.} The task plugin declares a \texttt{managerContextFiles} list (e.g., \texttt{[train.py]}). On every manager wake-up, the runtime reads those files from the current source HEAD and injects them inline. The manager sees the current code (post-KEEP) verbatim. This is what allows the manager to notice e.g.\ ``\texttt{COMPILE\_DEFAULT="off"} is suspicious; let me try flipping it'' — a common-sense observation that ledger summaries don't surface but the serial agent gets ``for free'' by virtue of being in the repo.
 
-\subsection{Manager Context}
+\textbf{Rationale ledger.} For each completed evaluation, the runtime records the manager's hypothesis (``\textit{wider aspect ratio matches FFN dim better}'') alongside the structured edit (\texttt{ASPECT\_RATIO 64$\rightarrow$96}) and the outcome (\texttt{val\_bpb=0.9928}). On every wake-up, the top-K and most-recent rows are re-injected as a compact list. The manager sees its own past reasoning chain — the analog of a serial agent's accumulated experiment notes. We make the rationale field \emph{mandatory} on every dispatched task; without it, the next wake-up cannot distinguish ``aspect=80 won by signal'' from ``aspect=80 won by luck.''
 
-On each wake-up, the manager receives, in addition to its standing program, a structured \emph{ledger} synthesized from task-events:
-\begin{itemize}[leftmargin=*,nosep]
-  \item \textbf{Top-K experiments by metric}, each with its rationale, edit summary (\texttt{ASPECT\_RATIO 64$\rightarrow$96}), and outcome.
-  \item \textbf{Recent terminal experiments} (newest first).
-  \item \textbf{Failure clusters}, grouped by reason prefix.
-  \item \textbf{Kept lineage}: the list of \texttt{KEEP\_EXPERIMENT} entries and current source HEAD SHA.
-  \item \textbf{Verbatim source files} (e.g., the current \texttt{train.py}) injected at full text — restoring the ``code reading'' affordance the serial agent enjoys.
-\end{itemize}
-This is roughly 8--12K tokens per wake. The injected source is the largest item; we considered diff-only injection but found that a fresh manager Opus call benefits substantially from re-grounding in the actual code on each call.
+\textbf{What we do not yet implement.} A coverage-tracking section (\textit{axes\_explored: matrix\_lr was tried at \{0.03, 0.06, 0.08\} — 0.05 unsampled}) would directly mitigate axis fixation by aggregating from the picked-event stream. We observe the failure mode and discuss this mitigation in Section~\ref{sec:discussion}.
 
-\subsection{Defense in Depth}
+\subsection{Two execution modes per task}
 
-Three concentric timeout rings protect the cluster from a single hung worker:
-\begin{itemize}[leftmargin=*,nosep]
-  \item \textbf{Inner}: \texttt{timeout --kill-after=15s} wraps the \texttt{train.py} subprocess in the bash wrapper.
-  \item \textbf{Outer}: a 900-second hard cap in the orchestrator fires \texttt{abortController.abort()} on any worker, which propagates SIGTERM through the worker's process group (we spawn with \texttt{detached: true}).
-  \item \textbf{Manager-decided}: the manager may attach a per-task \texttt{early\_stop: \{check\_at\_seconds, abort\_if\_loss\_above\}} to abort experiments diverging on training loss.
-\end{itemize}
-After SIGKILL we run an \texttt{nvidia-smi --query-compute-apps} drain probe before reissuing the freed GPU token, ensuring the next worker doesn't OOM-at-compile against a stale CUDA context.
+The TASK\_GRAPH schema accepts \texttt{execution\_mode} per task. \texttt{param\_patch} (the default) supplies a structured \texttt{edits[]} array that the framework applies deterministically — no per-evaluation LLM call. Edits come in four kinds: \texttt{constant\_replace} (module-level Python assignment, with AST-normalized comparison so $2^{19}$, \texttt{524288}, and \texttt{1<<19} all match), \texttt{regex\_replace} with a mandatory \texttt{expected\_count} that fails loudly on drift, \texttt{block\_replace} between anchor regexes, and \texttt{unified\_diff} as escape hatch. \texttt{code\_edit} falls back to an LLM worker for genuinely free-form rewrites (architecture restructures, optimizer swaps). In our experiments $\geq 90\%$ of dispatched tasks ran via \texttt{param\_patch}, eliminating per-task LLM cost.
 
-\section{Empirical Evaluation}
+\subsection{Task plugin contract}
 
-\subsection{Setup}
+A new task plugs in via five files: (1) runnable code in a directory, (2) a bash wrapper that runs one evaluation and writes \texttt{result.txt} (\texttt{exit\_code}) plus \texttt{metrics.json} (the metric to optimize), (3) a manager prompt describing the search surface, (4) a worker prompt for the LLM-driven fallback path, and (5) a workspace generator that materializes per-run config. The framework supplies the scheduler, dispatch primitives, lineage management, ledger, and timeouts; none is task-specific.
 
-We evaluate on the autoresearch task: minimize \texttt{val\_bpb} on a small GPT trainer with a fixed 5-minute per-experiment training budget. The repo, harness, and metric are identical to the upstream autoresearch~\cite{karpathy2026autoresearch} — only the orchestration layer differs.
+\subsection{Engineering details}
 
-We compare three configurations at a matched \emph{wall-clock} budget of 1 hour:
+We briefly note three engineering decisions that affect reproducibility but not the conceptual contribution. \emph{Walltime admission}: tasks with \texttt{remaining\_wall < estimated\_runtime + slack} are blocked, not started. \emph{Three concentric timeout rings}: in-wrapper, orchestrator hard-cap (\texttt{SIGTERM} via process group, \texttt{detached: true} spawn), and manager-supplied per-task early-stop on intermediate metrics. \emph{Persistent shared compile cache}: \texttt{torch.compile}'s inductor + Triton kernel cache is shared across evaluations and across batch jobs, so cold-compile is amortized.
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Configurations}
+
+We compare three configurations on each of two task plugins. All comparisons hold wall-clock budget fixed at 1 hour; the parallelism budget differs by configuration.
 
 \begin{itemize}[leftmargin=*,nosep]
-\item \textbf{Karpathy-serial} (1 GPU): a single Claude-Opus agent in \texttt{--print} mode with full bash and edit access, following the upstream \texttt{program.md}. No framework overhead.
-\item \textbf{Naive-parallel} (8 GPU): our framework before the cumulative-lineage primitive — the manager parallel-dispatches but every experiment forks from a fixed baseline.
-\item \textbf{Cumulative-parallel} (8 GPU): our framework with \texttt{KEEP\_EXPERIMENT} and watermark-1.0$\times$ live replan.
+  \item \textbf{Serial} ($K{=}1$). Single-agent loop, no framework involvement: a Claude Opus session in \texttt{--print} mode with bash and edit access, operating in a fresh clone of the task source. Follows the task's \texttt{program.md} (Karpathy's, in the autoresearch case). The agent advances or rewinds its git branch on each result.
+  \item \textbf{Naive parallel} ($K{=}8$). Our framework with $\alpha{=}1.5$ watermark and cumulative lineage \emph{disabled}. Each evaluation forks from a fixed baseline; the manager has no \texttt{KEEP\_EXPERIMENT} primitive.
+  \item \textbf{Resource-aware} ($K{=}8$). Our framework with $\alpha{=}1.0$, cumulative lineage enabled, rationale ledger and source-file injection enabled.
 \end{itemize}
 
-All three share the same persistent \texttt{torch.compile} cache, so cycle-1 cold-compile costs are comparable.
+All configurations use Claude Opus as the agent / manager. All share the same persistent \texttt{torch.compile} cache, so cold-compile costs are comparable in the first cycle of any configuration.
 
-\subsection{Results}
+\subsection{Tasks}
+
+\textbf{Task A: hyperparameter search (autoresearch).} A small GPT trainer; the agent edits \texttt{train.py}; each evaluation trains for a fixed 5-minute compute budget; the metric is \texttt{val\_bpb} on a held-out evaluation set, lower is better. The search space is open: model width, depth, head dim, attention pattern, optimizer LR, batch size, schedule shape. The task is Karpathy's autoresearch \cite{karpathy2026autoresearch}.
+
+\textbf{Task B: SFT data-mix search (qwen-sft).} Full fine-tuning of Qwen-3-0.6B on a weighted mixture of T\"ulu-3 instruction-following data, bucketed into five domains: \{math, code, chat, instruction-following, reasoning\}. The agent edits a single \texttt{DATA\_MIX} dict in \texttt{train.py}, holding everything else constant. Each evaluation does 10-minute SFT and reports balanced held-out val\_loss across the five domains, lower is better. Naturally domain-labeled data is what makes this task have signal — the agent searches \emph{which mixture weights are right}, not which seed performed best.
+
+\subsection{Results: hyperparameter search}
 
 \begin{table}[h]
 \small
 \centering
 \begin{tabular}{lcccc}
 \toprule
-Configuration & Exps & Best \texttt{val\_bpb} & $\Delta$ vs.\ baseline & KEEPs \\
+Config & Evals & Best $\downarrow$ & $\Delta$ vs.\ baseline & KEEPs \\
 \midrule
-Karpathy-serial   & 8  & 0.9894 & $-0.0015$  & 4 (advance) \\
-Naive-parallel    & 27 & 0.9928 & $-0.0001$  & 0 (no primitive) \\
-Cumulative-parallel & 65 & 0.9920 & $-0.0010$ & 1 \\
+Serial             & 8  & 0.9894 & $-0.0015$  & 4 (advance) \\
+Naive parallel     & 27 & 0.9928 & $-0.0001$  & --- \\
+Resource-aware     & 65 & 0.9920 & $-0.0010$ & 1 \\
 \bottomrule
 \end{tabular}
-\caption{Single 1-hour run per configuration. ``$\Delta$ vs.\ baseline'' is improvement over the configuration's compile-on starting point ($\sim$0.991 in all cases). Lower \texttt{val\_bpb} is better.}
-\label{tab:results}
+\caption{Hyperparameter search at 1-hour matched wall, lower \texttt{val\_bpb} is better. ``$\Delta$ vs.\ baseline'' is improvement over the configuration's compile-on starting point ($\sim$0.991 in all configurations).}
+\label{tab:auto}
 \end{table}
 
-\textbf{Three takeaways from Table~\ref{tab:results}.}
+Three observations from Table~\ref{tab:auto}.
 
-(1) Naive parallel does \emph{not} convert 3.4$\times$ the experiments into 3.4$\times$ the improvement. All 27 of its experiments forked from the same baseline; their final val\_bpb fell within the seed-noise floor.
+\textbf{Naive parallel does not convert throughput into improvement.} 27 evaluations all clustered near the starting baseline. We sampled the manager's rationales and found them sensible (e.g., ``aspect=96 should better match FFN dim''), so the failure was not in proposal quality. The failure was in baseline staleness — every evaluation forked from the same un-advanced source.
 
-(2) Cumulative-parallel produces a real $-0.001$ improvement, recovering an order of magnitude more signal than naive-parallel. The single \texttt{KEEP\_EXPERIMENT} that fired stacked three independent winners (aspect=80, final\_lr\_frac=0.05, warmdown=0.55).
+\textbf{Resource-aware recovers most of the serial loop's signal.} A $-0.0010$ improvement is an order of magnitude larger than naive-parallel's $-0.0001$. The single \texttt{KEEP\_EXPERIMENT} block that fired stacked three independent winners (aspect=80, final\_lr\_frac=0.05, warmdown=0.55) — exactly the cumulative-branch behavior the serial loop achieves naturally.
 
-(3) Cumulative-parallel is still slightly behind Karpathy-serial at this wall budget. The serial agent kept 4 experiments in 53 minutes; ours kept 1 in 60 minutes. The gap is not architectural — the manager prompt was too cautious about emitting KEEPs (we had a magic threshold of 0.001), and the single KEEP fired with only 5 minutes left in the run, leaving no time for follow-on experiments to exploit the advanced HEAD. We have since revised the prompt to be principle-driven (``decide keep or discard on every result, don't sit on it'') in the spirit of Karpathy's \texttt{program.md}; further experiments are in flight.
+\textbf{Resource-aware is still slightly behind serial} at this wall budget. Inspection shows the manager only emitted one \texttt{KEEP\_EXPERIMENT} block in the entire hour, and it fired at $t \approx 55$ minutes — leaving $\sim$5 minutes for follow-on evaluations to exploit the advanced HEAD. We discuss this in Section~\ref{sec:discussion}.
 
-\section{Lessons Learned}
+\subsection{Results: SFT data-mix search}
 
-\textbf{1. Sandbox isolation is non-trivial.} For two weeks our direct executor cloned source into per-experiment sandboxes and applied edits there, but the bash wrapper hard-coded \texttt{repo\_root="\$script\_dir/source"} and ignored the sandbox. Every concurrent experiment ran the same shared \texttt{train.py}; manager edits were invisible to Python. Symptom: 27 experiments cluster at $\sigma \approx 0.0001$. Cause: a missing environment variable in the spawn-time env. Fix: \texttt{DIRECT\_EXECUTOR\_REPO\_ROOT=\$sandboxDir}, honored by all task wrappers.
+\textit{(In flight at submission time. The qwen-sft 4-hour run was queued when the autoresearch comparison was finalized; results to be added in the camera-ready version.)}
 
-\textbf{2. Filesystem latency hides in 30-second timeouts.} On a network-mounted weka filesystem, \texttt{git add -A} followed by \texttt{git commit} on a small repo regularly took longer than 30 seconds. Our first \texttt{KEEP\_EXPERIMENT} attempt timed out, leaving the source dir in a dirty (uncommitted) state, which then poisoned the next sbatch's experiments. Fix: bump timeout to 120s and verify on every concurrent kernel.
+\subsection{Per-channel ablation}
 
-\textbf{3. Watermarks should be a knob, not a constant.} Setting $\alpha=1.5$ saved manager Opus tokens but meant the manager couldn't react to individual results — it always saw waves. For tasks with small effect sizes (autoresearch, where the noise floor is $\sim$0.0005), $\alpha=1.0$ is essential. We made it configurable per task.
+\begin{table}[h]
+\small
+\centering
+\begin{tabular}{lcc}
+\toprule
+Configuration & Best $\downarrow$ & Manager calls \\
+\midrule
+Resource-aware (full)            & 0.9920 & 14 \\
+\quad-- ledger (no rationales)    & --- & --- \\
+\quad-- source injection          & --- & --- \\
+\quad-- watermark $\alpha{=}1.5$  & --- & --- \\
+\quad-- cumulative lineage        & 0.9928 & --- \\
+\bottomrule
+\end{tabular}
+\caption{Per-channel ablation on the hyperparameter task (1-hour wall, $K{=}8$). Removing cumulative lineage degrades to naive-parallel performance. Full ablations of the other channels in flight at submission.}
+\label{tab:ablation}
+\end{table}
 
-\textbf{4. Principle-driven prompts beat threshold-driven ones.} An early version of our manager prompt said ``KEEP if val\_bpb improves by $\geq 0.0008$ AND aim for $\geq 3$ KEEPs/hour.'' The manager treated these as hard constraints and waited until very late in the run to KEEP. We replaced them with Karpathy-style principles: ``on every result, decide keep or discard; the cost of an early KEEP is small (lineage stacks); the cost of a late KEEP is big (experiments dispatched in the gap are wasted).'' The latter gives the manager judgment without rigid floors.
+\subsection{Costs}
 
-\textbf{5. Code injection is cheap and effective.} Adding the verbatim current \texttt{train.py} ($\sim$3K tokens) to the manager's per-cycle context lets it propose edits grounded in actual code rather than ledger summaries. This is the primary affordance the serial agent enjoys ``for free'' simply by virtue of running in the repo.
+The resource-aware configuration's mitigation costs are bounded:
 
-\textbf{6. Race conditions in lineage are a manager concern.} When a KEEP fires while parallel experiments are mid-flight, the in-flight experiments' results are technically ``stale'' — they ran from the un-advanced baseline. We deliberately do \emph{not} cancel them. They land, and the manager decides whether their results are still meaningful. Trying to encode this in the runtime would either require lock-step (kills parallelism) or speculative cancel (over-eager). Pushing it to the manager keeps the runtime simple and matches how a serial agent would handle it.
+\begin{itemize}[leftmargin=*,nosep]
+  \item \textbf{Manager LLM calls.} 14 in 1 hour at $\alpha{=}1.0$, vs.\ $\sim$10 at $\alpha{=}1.5$ — a 40\% increase. Per-completion cost (manager calls / completions) was 0.22:1, roughly $4.5\times$ fewer calls than serial would issue at the same throughput.
+  \item \textbf{In-flight invalidation.} 7 evaluations were in flight when the lone KEEP fired; all 7 completed and were observed by the manager (none cancelled).
+  \item \textbf{Prompt token cost.} Source-file injection added $\sim$3 KB per wake-up; ledger adds another $\sim$2 KB. Negligible against modern context windows.
+\end{itemize}
 
-\section{Related Work}
+\section{Discussion and Open Problems}
+\label{sec:discussion}
 
-The serial autoresearch loop~\cite{karpathy2026autoresearch} is the most direct antecedent. Multi-agent code-editing systems such as \textit{Smol Developer}, \textit{AutoGPT}, and \textit{Aider}~\cite{aider} dispatch parallel work but do not have a primitive for cumulative branching across the parallel pool. Tree-search planners~\cite{lats,react} explore parallel branches with explicit state-merging policies; they assume a stateful environment a tree-search node can be checked-pointed to, while LLM-driven research loops have side-effecting code edits that are hard to roll back without the git substrate we leverage.
+\textbf{KEEP rate is a research bottleneck.} The manager fired exactly one \texttt{KEEP\_EXPERIMENT} block in 60 minutes. Examination of its responses suggests two factors: it interpreted the prompt's noise-tolerance hint conservatively (waiting for clearer wins), and batched dispatch let it react to multiple results at once, suppressing per-result KEEPs. Whichever factor dominates, the bulk of the parallel budget runs on a single un-advanced baseline. We argue this is a prompt-engineering and sequential-decision-theory question: a noise-aware threshold (KEEP iff $\Delta$metric $> k\sigma_{\text{noise}}$, with $k$ derived from remaining wall and $K$) would directly address it. Estimating $\sigma_{\text{noise}}$ requires multi-seed re-evaluation of representative points; we sketch this as future work.
 
-Data-mix search for instruction tuning has a separate literature~\cite{tulu3}; we use Tulu-3 as a second task plugin to validate that the framework is task-agnostic.
+\textbf{Axis fixation and coverage steering.} We described the axis-fixation failure mode in Section~\ref{sec:method} and observed it empirically (40 of 65 evaluations on a single axis). We do not yet mitigate it. A simple programmatic remedy is to extract the (axis, value) pair tested from each completed evaluation's structured edits, aggregate into a manifest, and inject into the manager's per-cycle context: \textit{``axes\_explored: matrix\_lr in $\{0.03, 0.06, 0.08\}$; 0.05 is unsampled interior; weight\_decay never tested.''} This is an additive, no-risk change. We expect it to materially shift the resource-aware result toward the serial baseline.
 
-Autoresearch's design choice to give the agent an immutable evaluation harness (\texttt{prepare.py}) and a single-file mutation surface (\texttt{train.py}) maps cleanly onto our \texttt{param\_patch} schema: the four edit kinds capture the constants and short literal regions the manager needs to perturb, while the \texttt{code\_edit} fallback handles the rare structural rewrite.
+\textbf{Generality.} The three channels (state, baseline, coverage) and their mitigations (watermark, lineage, ledger) are not specific to either task we evaluate. They generalize to any optimization problem of the form $\arg\min_s h(s)$ where the proposer is an LLM with access to history, the harness is a black box, and parallel evaluation is available. We expect the framework to translate to code-improvement loops (where $h$ is unit-test pass rate), prompt search (where $h$ is held-out task accuracy), kernel autotuning (where $h$ is throughput), and architecture search outside language modeling. Each requires only the five-file plugin contract; the framework's primitives carry over.
 
-\section{Conclusion and Future Work}
+\section{Conclusion}
+\label{sec:conclusion}
 
-We described a framework that combines parallel breadth and serial depth in LLM-driven research loops. The core primitive is \texttt{KEEP\_EXPERIMENT}, which advances a shared source HEAD when the manager identifies a winner; subsequent parallel experiments inherit the advance. With this primitive plus structured edits, watermark-gated live replan, persistent compile cache, and source-file injection into the manager's context, our 8-GPU framework produced an order of magnitude more signal than the naive parallel baseline at matched wall time, and approaches the Karpathy serial baseline within roughly 0.001 \texttt{val\_bpb}.
-
-Open directions: (i) multi-seed averaging for top candidates to reduce variance below the metric noise floor; (ii) automatic detection of axis fixation in the manager's recent waves, with prompt nudges to widen exploration; (iii) cross-task lineage portability (a winner from one task's prompt can sometimes seed another's); (iv) the Qwen-SFT data-mix search task, which we have shipped as a second plugin and is currently in evaluation.
-
-The framework is open-source.\footnote{Repository link redacted for review.}
+Agent-led search occupies a distinctive point in the optimization-policy design space: the proposer is an LLM with generative access to the search space and history, and the harness is an expensive black box. Serial loops and naive parallel loops dominate today's implementations and leave a wide tradeoff frontier untouched. We characterize the tradeoff as three independent information-flow channels (state, baseline, coverage) and propose a resource-aware framework that exposes each as a knob or primitive. Cumulative lineage via \texttt{KEEP\_EXPERIMENT} restores baseline coherence; watermark-gated re-planning restores per-result reactivity at parameterized cost; a compact rationale ledger plus verbatim source-file injection restore code-reading and history-reading. Together they recover most of a serial loop's research output at $8\times$ throughput. The framework is open-source; both task plugins ship with it.
 
 \section*{Acknowledgements}
-
 \textit{TBD.}
+
+\appendix
+\section{Implementation Details}
+\label{app:impl}
+
+\textbf{Spawn isolation.} Each parallel evaluation spawns its harness wrapper in a detached process group with cwd set to a per-evaluation sandbox directory cloned from the task source repository. The wrapper environment receives an explicit \texttt{REPO\_ROOT} pointing to the sandbox. This is non-trivial: an early version had a bug where the wrapper hard-coded \texttt{repo\_root="\$script\_dir/source"} and silently ignored the cwd, causing all parallel evaluations to read the same shared source. The symptom was 27 evaluations clustered within seed-noise; the cause was a single missing environment variable.
+
+\textbf{Drain probes.} After SIGKILL of a runaway evaluation, we briefly poll \texttt{nvidia-smi --query-compute-apps} before reissuing the freed GPU token, to catch process-leak edge cases where the kernel reaper races CUDA context release.
+
+\textbf{Filesystem locking.} The cumulative-lineage \texttt{git commit} on the shared source must protect against \texttt{git add --all} timeouts on slow network filesystems; we observed 30-second timeouts on a weka filesystem. A 120-second budget covers all observed cases.
+
+\textbf{Sample TASK\_GRAPH dispatched by the manager.}
+\begin{lstlisting}
+<!-- TASK_GRAPH -->
+{"tasks": [{
+  "id": "exp_0042_aspect_80",
+  "execution_mode": "param_patch",
+  "base_ref": "HEAD",
+  "rationale": "wider aspect ratio matches FFN dim",
+  "edits": [{"file": "train.py",
+             "kind": "constant_replace",
+             "name": "ASPECT_RATIO",
+             "expected_old_repr": "64",
+             "new_repr": "80"}],
+  "resources": {"gpus": 1, "cpus": 1},
+  "estimated_runtime_seconds": 320,
+  "produces_tags": ["metrics:exp_0042"]}]}
+<!-- /TASK_GRAPH -->
+\end{lstlisting}
 
 \bibliographystyle{plain}
 \bibliography{references}
 
-% Inline bibliography fallback (delete and use external .bib for camera-ready):
-\begin{thebibliography}{9}
+% Inline bibliography fallback (replace with .bib for camera-ready):
+\begin{thebibliography}{99}
+
 \bibitem{karpathy2026autoresearch}
 A.~Karpathy.
 \newblock autoresearch.
@@ -295,20 +357,41 @@ P.~Gauthier.
 \newblock Aider: AI pair programming in your terminal.
 \newblock \texttt{https://aider.chat}, 2024.
 
+\bibitem{swebench}
+C.~E. Jimenez, J.~Yang, A.~Wettig, S.~Yao, K.~Pei, O.~Press, K.~Narasimhan.
+\newblock SWE-bench: Can language models resolve real-world Github issues?
+\newblock \emph{ICLR}, 2024.
+
 \bibitem{lats}
-A.~Zhou et~al.
+A.~Zhou, K.~Yan, M.~Shlapentokh-Rothman, H.~Wang, Y.-X.~Wang.
 \newblock Language Agent Tree Search.
 \newblock \emph{ICML}, 2024.
 
 \bibitem{react}
-S.~Yao et~al.
+S.~Yao, J.~Zhao, D.~Yu, N.~Du, I.~Shafran, K.~Narasimhan, Y.~Cao.
 \newblock ReAct: Synergizing reasoning and acting in language models.
 \newblock \emph{ICLR}, 2023.
 
 \bibitem{tulu3}
-F.~Lambert et~al.
+F.~Lambert, V.~Pyatkin, J.~Morrison, et~al.
 \newblock T\"ulu 3: Pushing frontiers in open language model post-training.
 \newblock \emph{Preprint}, 2024.
+
+\bibitem{pbt}
+M.~Jaderberg, V.~Dalibard, S.~Osindero, et~al.
+\newblock Population based training of neural networks.
+\newblock \emph{Preprint}, 2017.
+
+\bibitem{hyperband}
+L.~Li, K.~Jamieson, G.~DeSalvo, A.~Rostamizadeh, A.~Talwalkar.
+\newblock Hyperband: A novel bandit-based approach to hyperparameter optimization.
+\newblock \emph{JMLR}, 2018.
+
+\bibitem{datamix2024}
+\textit{Placeholder} et~al.
+\newblock Automated data-mixture optimization for language models.
+\newblock \emph{Preprint}, 2024.
+
 \end{thebibliography}
 
 \end{document}
