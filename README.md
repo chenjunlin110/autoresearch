@@ -1,92 +1,106 @@
-# autoresearch
+# Concurrent Search-Task Framework
 
-![teaser](progress.png)
+A small framework for running **complex search tasks** under a shared compute allocation, where the search policy is an LLM and the search execution runs in parallel across many GPUs.
 
-*One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
+The framework gives you:
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069) and [this tweet](https://x.com/karpathy/status/2031135152349524125).
+1. A **manager LLM** that proposes experiments, given prior results.
+2. A **worker pool** plus a **deterministic direct executor** for parameter-patch tasks (no worker LLM, no per-task LLM cost).
+3. A **DAG scheduler** with priority, dependencies, watermark-gated live replan, kill primitive, walltime + GPU admission, and three concentric timeout rings.
+4. A **per-experiment git sandbox** so concurrent edits don't step on each other; experiment lineage is git history.
+5. A **persistent `torch.compile` cache** shared across workers and across sbatch runs.
 
-## How it works
+The first concrete task is [autoresearch](https://github.com/karpathy/autoresearch) (LLM-driven hyperparameter + architecture search on a small GPT trainer). The framework is intended for any search problem that fits the shape:
 
-The repo is deliberately kept small and only really has three files that matter:
+- there is a body of "main code" that runs and emits a metric
+- the search proposes edits to that code (a hyperparameter, a code change, a config)
+- you want many edits running concurrently with the manager picking the next batch from results
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+Examples beyond autoresearch:
+- hyperparameter sweeps decoupled from autoresearch's specific knobs
+- data-mix search (manager proposes mixture weights → worker runs eval → result feeds next proposal)
+- prompt / system-prompt search
+- compiler / kernel autotuning where each candidate runs a benchmark
 
-By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
+## Repository layout
 
-If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/status/2030720614752039185) looks pretty good for a lot more context.
+```text
+repo/
+  infra/hpc_agent/runner/        # framework: scheduler, runtime, manager/worker dispatch
+    src/
+      server.js                  # ProjectRunner, scheduler loop, live replan, kill, grants
+      orchestration-utils.js     # TASK_GRAPH parser (incl. execution_mode + edits[])
+      scheduler.js               # ranking + worker-class binding (pure functions)
+      resource-orchestration.js  # SQLite token grant lifecycle
+      agent-runner.js            # claude_cli / codex_cli / api runtime adapters
+      direct-executor.js         # non-LLM execution path for param_patch tasks
+      edits.js + edits-ast.py    # 4-kind structured edits with Python AST normalization
+      task-events.js             # per-task lifecycle event log
+      result-validator.js        # canonical truth from result.txt + metrics.json
+      experiment-ledger.js       # compact "rationale → outcome" memory for the manager
+      slurm-walltime.js          # walltime admission gate
+      cycle-report.js            # aggregate per-cycle telemetry
+      gpu-probe.js               # nvidia-smi drain probe after kill
+    tests/                       # 92 unit + integration tests
+    agent/                       # framework-level manager/worker rules
+
+  tasks/
+    autoresearch/                # the autoresearch task plugin
+      source/                    # the executable code: train.py, prepare.py, program.md
+      manager-full.js            # workspace generator + manager/worker prompts
+      worker.sh                  # bash wrapper (timeout + flock + early-stop watcher)
+      sandbox.sh                 # per-experiment git clone (LLM-worker path)
+      submit.sbatch              # 8-GPU framework run
+      baseline-submit.sbatch     # 1-GPU Karpathy-style baseline run
+      tests/                     # task-level smoke test
+
+  artifact/                      # gitignored: per-run outputs (project DB, sandboxes, logs)
+
+  docs/
+    architecture.md              # framework architecture
+    notes/                       # design notes
+```
+
+## Adding a new task
+
+A task plugin needs:
+
+1. **Code that runs end-to-end on its own.** A directory with the executable code and an immutable evaluation harness. For autoresearch this is `tasks/autoresearch/source/{train.py, prepare.py}`.
+2. **A wrapper script** that runs one experiment and writes `result.txt` (`exit_code=...`) + `metrics.json` (`{the_metric: <number>}`). For autoresearch: `tasks/autoresearch/worker.sh`.
+3. **A manager prompt** describing the search surface, the metric, and how to translate ideas into TASK_GRAPH entries (with `execution_mode`, `edits[]`, `rationale`).
+4. **A worker prompt** for the LLM-worker fallback path (`code_edit` mode).
+5. **A workspace generator** that materializes `config.yaml`, `projects.yaml`, `state.json`, manager/worker skill files. For autoresearch: `tasks/autoresearch/manager-full.js`.
+
+The framework supplies the scheduler, GPU grant lifecycle, kill, replan, retry, walltime admission, canonical result validation, per-task event tracing, the direct executor, the structured-edit primitives, and the persistent compile cache — none of it is autoresearch-specific.
+
+The `/new-task` slash command in this repo's `.claude/skills/` scaffolds a fresh task plugin from the autoresearch template.
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
-
 ```bash
+git clone <this-repo> && cd autoresearch && git checkout framework
 
-# 1. Install uv project manager (if you don't already have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
+cd infra/hpc_agent/runner && npm install && npm test    # 92 tests, ~40s
 
-# 2. Install dependencies
-uv sync
+# Launch the autoresearch task on Slurm: 8 GPUs × 2h, claude_cli runtime
+cd ../../..
+AUTORESEARCH_AGENT_RUNTIME=claude_cli sbatch --time=02:00:00 \
+  --export=ALL,AUTORESEARCH_AGENT_RUNTIME \
+  tasks/autoresearch/submit.sbatch
 
-# 3. Download data and train tokenizer (one-time, ~2 min)
-uv run prepare.py
-
-# 4. Manually run a single training experiment (~5 min)
-uv run train.py
+# Or compare against the original Karpathy single-agent design: 1 GPU × 1h
+sbatch tasks/autoresearch/baseline-submit.sbatch
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+Per-run outputs land under `artifact/autoresearch/run-<timestamp>/`. The persistent `torch.compile` cache lives at `$HOME/.cache/autoresearch-shared-cache/` so each fresh sbatch reuses kernels from prior runs (cycle-1 is warm).
 
-## Running the agent
+## Status
 
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
+The redesign described in `docs/notes/` (six phases: observability, timeouts, direct executor + structured edits, shared compile cache, watermark replan + compact ledger, refactor) is **landed**. End-to-end verified on 1h sbatch:
 
-```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
-```
+- ≥90% of manager-emitted tasks dispatch via the direct executor (no worker LLM)
+- ~50% reduction in manager Opus calls per worker completion (watermark gate)
+- Canonical truth-mismatch instrumentation in place
+- 92 / 92 tests passing
 
-The `program.md` file is essentially a super lightweight "skill".
-
-## Project structure
-
-```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
-pyproject.toml  — dependencies
-```
-
-## Design choices
-
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
-- **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
-
-## Platform support
-
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
-
-Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
-
-1. To get half-decent results I'd use a dataset with a lot less entropy, e.g. this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean). These are GPT-4 generated short stories. Because the data is a lot narrower in scope, you will see reasonable results with a lot smaller models (if you try to sample from them after training).
-2. You might experiment with decreasing `vocab_size`, e.g. from 8192 down to 4096, 2048, 1024, or even - simply byte-level tokenizer with 256 possibly bytes after utf-8 encoding.
-3. In `prepare.py`, you'll want to lower `MAX_SEQ_LEN` a lot, depending on the computer even down to 256 etc. As you lower `MAX_SEQ_LEN`, you may want to experiment with increasing `DEVICE_BATCH_SIZE` in `train.py` slightly to compensate. The number of tokens per fwd/bwd pass is the product of these two.
-4. Also in `prepare.py`, you'll want to decrease `EVAL_TOKENS` so that your validation loss is evaluated on a lot less data.
-5. In `train.py`, the primary single knob that controls model complexity is the `DEPTH` (default 8, here). A lot of variables are just functions of this, so e.g. lower it down to e.g. 4.
-6. You'll want to most likely use `WINDOW_PATTERN` of just "L", because "SSSL" uses alternating banded attention pattern that may be very inefficient for you. Try it.
-7. You'll want to lower `TOTAL_BATCH_SIZE` a lot, but keep it powers of 2, e.g. down to `2**14` (~16K) or so even, hard to tell.
-
-I think these would be the reasonable hyperparameters to play with. Ask your favorite coding agent for help and copy paste them this guide, as well as the full source code.
-
-## Notable forks
-
-- [miolini/autoresearch-macos](https://github.com/miolini/autoresearch-macos) (MacOS)
-- [trevin-creator/autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) (MacOS)
-- [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
-- [andyluo7/autoresearch](https://github.com/andyluo7/autoresearch) (AMD)
-
-## License
-
-MIT
+See `docs/architecture.md` for the framework contract and runtime data flow.

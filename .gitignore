@@ -15,9 +15,33 @@ queue/
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
 AGENTS.md
+.codex
+.codex/
 
-# Experimental code/artifacts
+# Generated per-run outputs (per-task subdir under artifact/).
+# `artifacts/` and `experiments/` are legacy paths from before the
+# tasks/<name>/ split; ignore them too so existing checkouts don't
+# accidentally restage cached run outputs.
 dev/
+artifact/
+artifacts/
+experiments/
+.hf-home/
+.uv-cache/
+.xdg-cache/
+.triton-cache/
+.torchinductor-cache/
+.shared-cache/
+.venv-managed/
+node_modules/
+*.log
+# Slurm sbatch stdout/stderr (written next to submit dir as %x-%j.out/.err)
+*.out
+*.err
 
 # Results file
 results.tsv
+
+# Per-machine env file (the runner generates one from .env.example)
+infra/hpc_agent/.env
+infra/hpc_agent/runner/.env
