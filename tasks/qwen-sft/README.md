@@ -2,7 +2,7 @@
 
 A task plugin for the framework. The manager LLM proposes mixture weights over
 distinct Tulu-3 SFT domains (math / code / chat / if / reasoning); a worker
-fully fine-tunes Qwen3-4B on that mixture for ~30 min; the held-out balanced
+fully fine-tunes Qwen3-0.6B on that mixture for ~10 min; the held-out balanced
 val loss is reported back; manager iterates.
 
 ## What's here
@@ -56,7 +56,7 @@ Per-run outputs land at `artifact/qwen-sft/run-<timestamp>/`.
 
 The manager edits exactly one thing: the module-level `DATA_MIX` dict in
 `source/train.py`. Five buckets, each in `[0.0, 1.0]`; the trainer
-normalizes the dict to sum to 1 internally. Everything else (Qwen3-4B,
+normalizes the dict to sum to 1 internally. Everything else (Qwen3-0.6B,
 seq_len 2048, micro_batch 4, grad_accum 4, lr 5e-6, warmup 50, weight_decay 0)
 is fixed across experiments.
 
@@ -76,6 +76,6 @@ the compact ledger surfaced in its per-cycle context.
 
 ## Memory
 
-Qwen3-4B full FT, bf16, with grad-ckpt + FlashAttention2 fits comfortably
+Qwen3-0.6B full FT, bf16, with grad-ckpt + FlashAttention2 fits comfortably
 in ~60 GB on a single H200 (144 GB), which leaves headroom for activations
 at micro-batch 4 / seq 2048. No FSDP / ZeRO needed; each worker is single-GPU.

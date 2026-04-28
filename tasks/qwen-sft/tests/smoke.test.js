@@ -12,7 +12,7 @@ test('createQwenSftWorkspace generates a workspace with val_loss metric and DATA
   try {
     const workspace = createQwenSftWorkspace({
       artifactRoot,
-      timeBudgetSeconds: 1800,
+      timeBudgetSeconds: 600,
       gpuCount: 8,
     });
 
@@ -27,7 +27,7 @@ test('createQwenSftWorkspace generates a workspace with val_loss metric and DATA
 
     const config = readFileSync(workspace.configPath, 'utf8');
     assert.match(config, /metricKey: val_loss/);
-    assert.match(config, /timeBudgetSeconds: 1800/);
+    assert.match(config, /timeBudgetSeconds: 600/);
     assert.match(config, /liveReplanOnTaskComplete: true/);
     assert.match(config, /liveReplanMinIntervalSeconds: 30/);
     assert.match(config, /directExecutor:/);
@@ -40,14 +40,14 @@ test('createQwenSftWorkspace generates a workspace with val_loss metric and DATA
     assert.match(managerProgram, /constant_replace/);
     assert.match(managerProgram, /execution_mode/);
     assert.match(managerProgram, /val_loss/);
-    assert.match(managerProgram, /1800s SFT budget/);
+    assert.match(managerProgram, /600s SFT budget/);
     assert.match(managerProgram, /Tulu-3/i);
     assert.match(managerProgram, /five buckets/i);
     assert.match(managerProgram, /Rationale is mandatory/);
 
     const workerProgram = readFileSync(workspace.workerProgramPath, 'utf8');
     assert.match(workerProgram, /qwen-sft worker program/);
-    assert.match(workerProgram, /SFT_TIME_BUDGET_SECONDS=1800/);
+    assert.match(workerProgram, /SFT_TIME_BUDGET_SECONDS=600/);
     assert.match(workerProgram, /val_loss/);
 
     const initialState = JSON.parse(readFileSync(workspace.statePath, 'utf8'));
@@ -59,7 +59,7 @@ test('createQwenSftWorkspace generates a workspace with val_loss metric and DATA
 
     const workerSkill = readFileSync(workspace.experimentWorkerSkillPaths[0], 'utf8');
     assert.match(workerSkill, /worker_class: experiment_runner/);
-    assert.match(workerSkill, /SFT_TIME_BUDGET_SECONDS=1800/);
+    assert.match(workerSkill, /SFT_TIME_BUDGET_SECONDS=600/);
     assert.match(workerSkill, /Read `worker_program\.md`/);
   } finally {
     rmSync(artifactRoot, { recursive: true, force: true });

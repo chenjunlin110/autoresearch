@@ -80,7 +80,7 @@ export function renderQwenSftReadme({
   workerScriptPath,
   sandboxScriptPath,
   workloadRoot = DEFAULT_WORKLOAD_ROOT,
-  timeBudgetSeconds = 1800,
+  timeBudgetSeconds = 600,
   gpuCount = 8,
 } = {}) {
   if (!workerScriptPath) throw new Error('workerScriptPath is required');
@@ -88,7 +88,7 @@ export function renderQwenSftReadme({
 
   return `# Qwen-SFT Data-Mix Search
 
-This run drives a manager + worker-pool search over **SFT data-mixture weights** for fine-tuning Qwen3-4B on Tulu-3. Each experiment fully fine-tunes the model for ${timeBudgetSeconds}s on the chosen mix, then reports balanced held-out \`val_loss\`.
+This run drives a manager + worker-pool search over **SFT data-mixture weights** for fine-tuning Qwen3-0.6B on Tulu-3. Each experiment fully fine-tunes the model for ${timeBudgetSeconds}s on the chosen mix, then reports balanced held-out \`val_loss\`.
 
 Read these before planning:
 - \`program.md\` — manager protocol
@@ -113,7 +113,7 @@ export function renderQwenSftManagerProgram({
   workerScriptPath,
   sandboxScriptPath,
   workloadRoot = DEFAULT_WORKLOAD_ROOT,
-  timeBudgetSeconds = 1800,
+  timeBudgetSeconds = 600,
   gpuCount = 8,
 } = {}) {
   if (!workerScriptPath) throw new Error('workerScriptPath is required');
@@ -123,7 +123,7 @@ export function renderQwenSftManagerProgram({
 
   return `# qwen-sft manager program
 
-You are the research manager for a **data-mix search** over Tulu-3 SFT mixtures applied to Qwen3-4B full fine-tuning. The framework dispatches your tasks to a pool of GPU workers; you propose new \`DATA_MIX\` weights and read back \`val_loss\`.
+You are the research manager for a **data-mix search** over Tulu-3 SFT mixtures applied to Qwen3-0.6B full fine-tuning. The framework dispatches your tasks to a pool of GPU workers; you propose new \`DATA_MIX\` weights and read back \`val_loss\`.
 
 ## Goal
 
@@ -131,7 +131,7 @@ Minimize balanced held-out \`val_loss\` under a fixed ${timeBudgetSeconds}s SFT 
 
 ## What you change
 
-Only \`DATA_MIX\` in \`${workloadRoot}/train.py\`. Everything else (model size = Qwen3-4B, seq_len = 2048, micro_batch = 4, grad_accum = 4, learning_rate = 5e-6, warmup = 50, weight_decay = 0) is fixed across experiments. Don't propose to change them via \`code_edit\` — those are the controlled axes.
+Only \`DATA_MIX\` in \`${workloadRoot}/train.py\`. Everything else (model size = Qwen3-0.6B, seq_len = 2048, micro_batch = 16, grad_accum = 1, learning_rate = 1e-5, warmup = 50, weight_decay = 0) is fixed across experiments. Don't propose to change them via \`code_edit\` — those are the controlled axes.
 
 The five buckets and their patterns are documented in \`~/.cache/qwen-sft/data/manifest.json\`. Inspect it before cycle 1 so you know each bucket's size and what's in it.
 
@@ -142,7 +142,7 @@ Output \`<!-- TASK_GRAPH -->\` blocks. Default to \`execution_mode: "param_patch
 - \`worker_class: "experiment_runner"\`
 - \`execution_mode: "param_patch"\` — required for cheap dispatch
 - \`base_ref: "HEAD"\` — leave as default
-- \`resources: {"gpus": 1, "cpus": 2}\` — Qwen3-4B full FT needs 1 H200
+- \`resources: {"gpus": 1, "cpus": 2}\` — Qwen3-0.6B full FT fits in <12 GB; 1 H200 has tons of headroom
 - Unique \`id\` like \`exp_0042_math_heavy\`
 - Unique \`produces_tags\` like \`["metrics:exp_0042_math_heavy"]\`
 - A \`task\` body that's a one-line description (it's logged but not executed)
@@ -253,7 +253,7 @@ Don't make cycle 1 a fine LR-sweep around uniform — that explores the smallest
 export function renderQwenSftWorkerProgram({
   workerScriptPath,
   sandboxScriptPath,
-  timeBudgetSeconds = 1800,
+  timeBudgetSeconds = 600,
 } = {}) {
   if (!workerScriptPath) throw new Error('workerScriptPath is required');
   if (!sandboxScriptPath) throw new Error('sandboxScriptPath is required');
@@ -285,7 +285,7 @@ If the manager schedules you with \`worker_class: "analyst"\`, just read the req
 export function renderQwenSftExperimentWorkerSkill({
   workerScriptPath,
   sandboxScriptPath,
-  timeBudgetSeconds = 1800,
+  timeBudgetSeconds = 600,
   resultsPath = null,
 } = {}) {
   if (!workerScriptPath) throw new Error('workerScriptPath is required');
@@ -366,13 +366,13 @@ function renderDirectExecutorBlock({
   outputRoot,
   resultsPath = null,
   sharedCacheRoot = null,
-  timeBudgetSeconds = 1800,
+  timeBudgetSeconds = 600,
   hardCapSeconds = 2700,
 }) {
   const envEntries = [];
   if (resultsPath) envEntries.push(`    QWEN_SFT_RESULTS_PATH: ${resultsPath}`);
   if (sharedCacheRoot) envEntries.push(`    AUTORESEARCH_SHARED_CACHE_ROOT: ${sharedCacheRoot}`);
-  // Reuse the existing HF cache so Qwen3-4B isn't re-downloaded per run.
+  // Reuse the existing HF cache so Qwen3-0.6B isn't re-downloaded per run.
   const hfHome = path.join(process.env.HOME || '', '.cache', 'huggingface');
   if (process.env.HOME) envEntries.push(`    HF_HOME: ${hfHome}`);
   const envLines = envEntries.length
@@ -403,7 +403,7 @@ export function createQwenSftWorkspace(options = {}) {
   const workerScriptPath = options.workerScriptPath || DEFAULT_WORKER_SCRIPT_PATH;
   const sandboxScriptPath = options.sandboxScriptPath || DEFAULT_SANDBOX_SCRIPT_PATH;
   const workloadRoot = options.workloadRoot || DEFAULT_WORKLOAD_ROOT;
-  const timeBudgetSeconds = Number(options.timeBudgetSeconds ?? 1800);
+  const timeBudgetSeconds = Number(options.timeBudgetSeconds ?? 600);
   const gpuCount = Number(options.gpuCount ?? 8);
   const experimentWorkerCount = Number(options.experimentWorkerCount ?? gpuCount ?? 8);
   const agentRuntime = options.agentRuntime || 'codex_cli';

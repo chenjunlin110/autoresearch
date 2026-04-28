@@ -1,7 +1,7 @@
 [project]
 name = "qwen-sft"
 version = "0.1.0"
-description = "Qwen3-4B SFT data-mix search task plugin"
+description = "Qwen3-0.6B SFT data-mix search task plugin"
 requires-python = ">=3.11"
 dependencies = [
   "torch>=2.4",
@@ -14,5 +14,5 @@ dependencies = [
 ]
 # flash-attn intentionally omitted: nvcc OOMs while compiling on this
 # cluster (saw "Killed" + nvcc exit 255 in CI). transformers falls back
-# to PyTorch SDPA which is ~10-20% slower for Qwen3-4B but works
+# to PyTorch SDPA which is ~10-20% slower for Qwen3-0.6B but works
 # everywhere; the data-mix search doesn't need flash-attn for signal.

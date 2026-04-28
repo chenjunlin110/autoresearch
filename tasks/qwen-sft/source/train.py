@@ -1,13 +1,13 @@
-"""Full-FT SFT trainer for Qwen3-4B on a weighted mix of Tulu-3 buckets.
+"""Full-FT SFT trainer for Qwen3-0.6B on a weighted mix of Tulu-3 buckets.
 
 The manager LLM proposes new mixture weights by editing the module-level
 ``DATA_MIX`` dict (via the framework's `param_patch` + `constant_replace`
 edit kind). Everything else here is a fixed search baseline:
 
-  - Qwen3-4B in bf16, full fine-tuning (no LoRA / no PEFT).
+  - Qwen3-0.6B in bf16, full fine-tuning (no LoRA / no PEFT).
   - Manual training loop with a weighted multi-source sampler, AdamW,
-    grad-ckpt + FlashAttention2 (transformers default).
-  - Train until either ``SFT_TIME_BUDGET_SECONDS`` (default 1800 = 30 min)
+    grad-ckpt + flash_attention_2 if available (falls back to SDPA).
+  - Train until either ``SFT_TIME_BUDGET_SECONDS`` (default 600 = 10 min)
     of wall time has elapsed, or 5,000 steps have run, whichever comes first.
   - Final ``val_loss`` is the *balanced* mean cross-entropy across all
     five buckets' held-out samples — gaming the metric by upweighting an
@@ -17,7 +17,7 @@ Outputs ``metrics.json`` with at minimum ``val_loss`` (finite float).
 The framework's result-validator reads this; the manager optimizes it.
 
 Run:
-    SFT_TIME_BUDGET_SECONDS=1800 \\
+    SFT_TIME_BUDGET_SECONDS=600 \\
     QWEN_SFT_METRICS_PATH=/abs/path/metrics.json \\
     uv run python train.py
 """
@@ -53,18 +53,25 @@ DATA_MIX = {
 }
 
 DATA_ROOT      = os.path.expanduser("~/.cache/qwen-sft/data")
-MODEL_NAME     = "Qwen/Qwen3-4B"
+# Qwen3-0.6B for demo: ~1.2 GB bf16, full FT comfortably under 12 GB on
+# H200. ~5-10× faster wall per experiment than 4B — we get more search
+# iterations per hour, which is what the data-mix search actually needs.
+# Bigger micro_batch (16 vs 4) since memory pressure is gone, and we drop
+# grad_accum=1 since one micro covers the effective batch we want.
+MODEL_NAME     = "Qwen/Qwen3-0.6B"
 SEQ_LEN        = 2048
-MICRO_BATCH    = 4
-GRAD_ACCUM     = 4
-LEARNING_RATE  = 5e-6
+MICRO_BATCH    = 16
+GRAD_ACCUM     = 1
+LEARNING_RATE  = 1e-5
 WARMUP_STEPS   = 50
 WEIGHT_DECAY   = 0.0
 GRAD_CKPT      = True
 MAX_STEPS      = 5000
-LOG_EVERY      = 5
+LOG_EVERY      = 10
 
-TIME_BUDGET = int(os.environ.get("SFT_TIME_BUDGET_SECONDS", "1800"))
+# 10 min default for demo — 0.6B trains fast enough that 10 min wastes
+# budget on an already-converged model. Override with SFT_TIME_BUDGET_SECONDS.
+TIME_BUDGET = int(os.environ.get("SFT_TIME_BUDGET_SECONDS", "600"))
 DEVICE = "cuda"
 
 

@@ -30,7 +30,7 @@ const result = createQwenSftWorkspace({
   projectId: args['project-id'] || 'qwen-sft',
   experimentName: args['experiment-name'] || 'experiments',
   workerScriptPath: args['worker-script'],
-  timeBudgetSeconds: args['time-budget-seconds'] || 1800,
+  timeBudgetSeconds: args['time-budget-seconds'] || 600,
   gpuCount: args['gpu-count'] || 8,
   experimentWorkerCount: args['experiment-worker-count'] || args['gpu-count'] || 8,
   agentRuntime: args['agent-runtime'] || process.env.AUTORESEARCH_AGENT_RUNTIME || 'codex_cli',

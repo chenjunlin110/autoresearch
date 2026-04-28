@@ -64,7 +64,7 @@ mkdir -p "$TBC_HOME/logs"
 export AUTORESEARCH_SHARED_CACHE_ROOT="${AUTORESEARCH_SHARED_CACHE_ROOT:-$HOME/.cache/autoresearch-shared-cache}"
 mkdir -p "$AUTORESEARCH_SHARED_CACHE_ROOT"
 
-# Reuse user's HF cache so Qwen3-4B isn't re-downloaded.
+# Reuse user's HF cache so Qwen3-0.6B isn't re-downloaded.
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
 {
@@ -90,7 +90,7 @@ node "$script_dir/create.js" \
   --project-id qwen-sft \
   --gpu-count 8 \
   --experiment-worker-count 8 \
-  --time-budget-seconds 1800
+  --time-budget-seconds 600
 
 ln -sf "$run_root/projects.yaml" "$TBC_HOME/projects.yaml"
 

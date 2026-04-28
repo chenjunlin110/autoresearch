@@ -36,9 +36,9 @@ else
 fi
 : "${QWEN_SFT_METRICS_PATH:=$output_dir/metrics.json}"
 : "${OMP_NUM_THREADS:=2}"
-: "${SFT_TIME_BUDGET_SECONDS:=1800}"
+: "${SFT_TIME_BUDGET_SECONDS:=600}"
 # Inner-ring training timeout: budget + slack. Slack is wider than autoresearch's
-# (300s vs 180s) because Qwen3-4B model loading + first compile can take 90-120s
+# (300s vs 180s) because Qwen3-0.6B model loading + first compile can take 90-120s
 # before training begins; we don't want to kill those.
 : "${SFT_TRAIN_TIMEOUT_SLACK_SECONDS:=300}"
 train_timeout=$((SFT_TIME_BUDGET_SECONDS + SFT_TRAIN_TIMEOUT_SLACK_SECONDS))
