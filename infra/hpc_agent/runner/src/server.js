@@ -2604,6 +2604,73 @@ class ProjectRunner {
    *
    * @private
    */
+  /**
+   * ALPS Phase 0/2A: dispatch the configured number of calibration
+   * baseline_repeat tasks at cycle 1, before the manager's first plan
+   * runs. Each task uses a deterministic per-id seed so seed-to-seed
+   * variance over val_bpb is the actual sample variance, giving the
+   * noise estimator real σ̂ instead of the conservative fallback.
+   *
+   * Idempotent: tracked via this._calibrationDispatched so re-parsing
+   * the same plan during live replan won't keep prepending tasks.
+   *
+   * @private
+   * @param {Object} taskGraph the parsed plan; calibration tasks are
+   *   prepended in place
+   */
+  _maybePrependCalibrationTasks(taskGraph) {
+    if (this._calibrationDispatched) return;
+    if (!this._isTaskGraphPlan(taskGraph) || !Array.isArray(taskGraph._tasks)) return;
+    const directConfig = this.loadConfig().directExecutor || null;
+    if (!directConfig?.enabled) return;
+    const n = directConfig.calibrationRepeats ?? 0;
+    if (!Number.isInteger(n) || n <= 0) {
+      this._calibrationDispatched = true;
+      return;
+    }
+    const orchestrationCfg = this.getOrchestrationConfig();
+    const defaults = orchestrationCfg?.defaultWorkerResources || { gpus: 1, cpus: 1 };
+    const synthetic = [];
+    for (let i = 0; i < n; i += 1) {
+      const id = `calib_baseline_${i + 1}`;
+      synthetic.push({
+        id,
+        type: 'agent',
+        agent: null,
+        workerClass: 'experiment_runner',
+        task: `Auto-enqueued ALPS calibration baseline_repeat #${i + 1} of ${n}. Runs the harness on HEAD with no edits and a unique PRNG seed so the noise estimator can compute σ̂ from real seed-to-seed variance instead of the fallback constant.`,
+        executionMode: 'baseline_repeat',
+        edits: null,
+        baseRef: 'HEAD',
+        earlyStop: null,
+        rationale: 'auto-enqueued calibration for ALPS noise estimation',
+        visibility: 'full',
+        resources: { gpus: defaults.gpus || 1, cpus: defaults.cpus || 1 },
+        retries: 0,
+        dependsOn: [],
+        dependsOnTags: [],
+        producesTags: [`metrics:${id}`, `calibration:${i + 1}`],
+        priority: 9, // above any manager-emitted task
+        utility: 1,
+        estimatedRuntimeSeconds: directConfig.timeBudgetSeconds || 300,
+        replanAfter: false,
+      });
+    }
+    taskGraph._tasks = [...synthetic, ...taskGraph._tasks];
+    this._ensureTaskGraphRuntime(taskGraph);
+    for (const t of synthetic) {
+      taskGraph._runtime.taskStates[t.id] = {
+        status: 'pending',
+        attempts: 0,
+        startedAt: null,
+        finishedAt: null,
+        reason: null,
+      };
+    }
+    this._calibrationDispatched = true;
+    log(`[calibration] auto-enqueued ${n} baseline_repeat task(s) at cycle 1 (priority=9, seed varies per id)`, this.id);
+  }
+
   _applyQuotaDiversity(taskGraph) {
     if (!this._isTaskGraphPlan(taskGraph) || !Array.isArray(taskGraph._tasks)) return;
     const directConfig = this.loadConfig().directExecutor || null;
@@ -3768,6 +3835,7 @@ class ProjectRunner {
         }
         schedule = this.parseSchedule(result.resultText);
         if (schedule) {
+          this._maybePrependCalibrationTasks(schedule);
           this._applyQuotaDiversity(schedule);
           log(`Schedule: ${JSON.stringify(schedule)}`, this.id);
         }
