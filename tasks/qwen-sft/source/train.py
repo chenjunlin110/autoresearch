@@ -227,10 +227,19 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Try flash-attn first; fall back to SDPA if not installed (some cluster
+    # nodes can't compile flash-attn). transformers handles this transparently
+    # — SDPA is ~10-20% slower but doesn't change the data-mix metric.
+    try:
+        import flash_attn  # noqa: F401
+        attn_impl = "flash_attention_2"
+    except Exception:
+        attn_impl = "sdpa"
+    print(f"loading model with attn_implementation={attn_impl}")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
     ).to(DEVICE)
     if GRAD_CKPT:
         model.gradient_checkpointing_enable()
