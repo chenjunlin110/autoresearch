@@ -245,9 +245,13 @@ What this does:
 3. Every subsequent \`param_patch\` task with \`base_ref: "HEAD"\` clones from this advanced HEAD — so its edit STACKS on top.
 4. The next manager-context you receive will show a **Kept lineage** section listing every kept experiment and the current source HEAD SHA.
 
-When to KEEP: when an experiment beats your current source HEAD by a margin clearly above noise (rule of thumb: ≥0.001 val_bpb on 5-min training; smaller wins should be re-tested before keeping). Multiple wins along independent axes (e.g., bs↑ and matrix_lr=0.05) can be kept together if both are clear.
+**On every result, decide keep or discard — don't sit on it.** This is the same principle as Karpathy's serial harness: each completed experiment either advances the branch or gets discarded, immediately. We dispatch in parallel so several results land at once, but the rule is the same — when a new completion appears in your ledger, your next response should already say what you're doing with it. If \`val_bpb\` improved over current source HEAD: emit \`KEEP_EXPERIMENT\`. If it didn't: leave it alone (the experiment is recorded; nothing more to do). Don't "wait one more wave to confirm" — that lag is the single biggest reason a parallel framework can underperform a serial one: every experiment dispatched between a win and an eventual KEEP started from the wrong baseline and is wasted.
 
-When NOT to KEEP: noise-level differences, regressions, crashes, anything you'd describe as "could be the seed".
+The cost of an early KEEP is small. If it later turns out the win was a fluke, just KEEP a better experiment on top — the lineage stacks, nothing is "rolled back". You're describing a chain, not picking a final winner.
+
+Multiple wins along independent axes can go in a single \`KEEP_EXPERIMENT\` block.
+
+**Don't KEEP**: regressions, crashes, no-edit baselines (the source already has them), or wins so small you'd describe them yourself as "could be the seed".
 
 When to UN-KEEP (rewind): there's no automatic primitive for this — if a kept experiment turns out to have been a fluke, you can effectively rewind by KEEPing the LATER version of that file (i.e., emit a \`code_edit\` task that produces the desired source state and then KEEP it, or just live with the slight regression and find new wins on top).
 
@@ -279,6 +283,8 @@ You will be called continuously. Every time the runtime queue runs shallow, the 
 3. **KEEP clearly-winning experiments** before emitting more tasks. If \`exp_0010\` beat the current source HEAD by a margin above noise, emit a \`<!-- KEEP_EXPERIMENT -->\` block in this same response so the next batch of tasks builds on it.
 4. If you need more detail than the ledger one-liners give, read \`${experimentName}/<id>/metrics.json\`, \`failure.json\`, or the per-experiment \`train.py\` (its diff vs the source baseline).
 5. Decide what to try next based on the patterns. **Exploit when you have a winner**: emit a fan-out around that winner's axis (e.g. winner is aspect=96 → try aspect=80, 112, plus aspect=96 combined with the next-best axis). **Explore when nothing's separating from baseline**: shift to a different axis you haven't explored.
+
+   **Don't fixate on one axis.** If your last several waves are all \`<axis>_X\` combinations of the same recent winner, you've stopped exploring. Before queuing yet another combination on the live axis, glance back at the ledger: which axes have you NOT touched yet at all? Which have you touched but only at the extremes (e.g. tried 0.04 and 0.06 but not 0.05)? The interior of an under-sampled range often beats yet another mixture on the over-sampled one.
 6. Append new tasks to the live TASK_GRAPH. Each task carries a \`rationale\`. Tasks' \`expected_old_repr\` should match the **current** source/train.py state (which reflects all KEPT experiments) — not the original baseline. Do not repeat existing task ids. New tasks must not depend on still-running task ids or unproduced tags.
 7. Keep around ${experimentsPerWave}-${backlogTarget} ready/pending GPU tasks queued so tokens never sit idle. Better to over-emit than under-emit: extra tasks just queue.
 
