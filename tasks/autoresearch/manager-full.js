@@ -473,6 +473,16 @@ function renderDirectExecutorBlock({
   maxPerOperatorPerWake: 4
   maxSameOperatorValuePerWake: 1
   alwaysAllowValidation: true
+  # Phase 3 hazard Q_t: off by default. Enable after Phase 2B has run
+  # long enough for the operator posterior to accumulate ≥3 single-edit
+  # samples per primary axis; otherwise the unreliable-cap dominates ρ
+  # and Q collapses to qMin too eagerly.
+  hazardQueueEnabled: false
+  qMin: 1
+  qMax: 8
+  hazardZeta: 2.0
+  posteriorMinSamples: 3
+  hazardCommitProbCap: 0.5
   searchAxes:
     - name: ASPECT_RATIO
       role: primary

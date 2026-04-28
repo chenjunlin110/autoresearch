@@ -59,6 +59,7 @@ import { buildOperatorPosterior, formatCoverageMarkdown } from './operator-poste
 import { shouldCommit, formatGateDecision, DECISION as GATE_DECISION } from './commit-gate.js';
 import { estimateNoise } from './noise-estimator.js';
 import { applyDiversityQuota } from './quota-diversity.js';
+import { adaptiveQueueDepth, formatHazardDecision } from './commit-hazard.js';
 import { readTaskEvents, taskEventsPath } from './task-events.js';
 import { listSessions as chatListSessions, createSession as chatCreateSession, getSession as chatGetSession, deleteSession as chatDeleteSession, updateSessionPreferences as chatUpdateSessionPreferences, streamChatMessage, getActiveStream, isStreaming as isChatStreaming, saveMessage as chatSaveMessage } from './chat.js';
 import { resolveModel, callModel, buildUserMessage, getModels as getPiModels } from './providers/index.js';
@@ -2671,6 +2672,66 @@ class ProjectRunner {
     log(`[calibration] auto-enqueued ${n} baseline_repeat task(s) at cycle 1 (priority=9, seed varies per id)`, this.id);
   }
 
+  /**
+   * ALPS Phase 3: compute the adaptive queue-depth cap from in-flight
+   * experiments + the operator posterior. Returns the configured
+   * maxConcurrentWorkers when hazardQueueEnabled is false, so the
+   * dispatcher's existing watermark behavior is preserved.
+   *
+   * Logs `[hazard] Q=… rho=… …` once per cycle when the feature is on,
+   * for parallel auditing alongside `[gate]` lines. Logging is rate-
+   * limited via _hazardLastLogKey so we don't spam the log when running
+   * unchanged.
+   *
+   * @private
+   */
+  _hazardQueueCap(running, orchestration) {
+    const directConfig = this.loadConfig().directExecutor || null;
+    const fallback = orchestration?.maxConcurrentWorkers ?? 8;
+    if (!directConfig?.hazardQueueEnabled) return fallback;
+    try {
+      const posterior = buildOperatorPosterior({
+        eventsDir: this.taskEventsDir,
+        metricKey: directConfig.metricKey || 'val_bpb',
+      });
+      // Pull picked event (with edits) for each in-flight experiment so
+      // operator extraction matches what the gate / posterior see.
+      const runningPicked = [];
+      for (const entry of running || []) {
+        const taskId = entry?.task?.id;
+        if (!taskId) continue;
+        const events = readTaskEvents(this.taskEventsDir, taskId);
+        const picked = (events?.events || []).find((e) => e.name === 'picked');
+        if (picked) runningPicked.push({ ...picked, task_id: taskId });
+      }
+      const decision = adaptiveQueueDepth({
+        runningPicked,
+        posterior,
+        config: {
+          hazardQueueEnabled: true,
+          qMin: directConfig.qMin ?? 1,
+          qMax: directConfig.qMax ?? fallback,
+          hazardZeta: directConfig.hazardZeta ?? 2.0,
+          posteriorMinSamples: directConfig.posteriorMinSamples ?? 3,
+          hazardCommitProbCap: directConfig.hazardCommitProbCap ?? 0.5,
+          fallbackSigma: directConfig.fallbackSigma,
+        },
+      });
+      if (!decision) return fallback;
+      // Throttle the log: only emit when the qTarget or rho changes
+      // materially, not on every dispatcher tick.
+      const key = `${decision.qTarget}|${decision.rho.toFixed(2)}|${runningPicked.length}`;
+      if (this._hazardLastLogKey !== key) {
+        log(formatHazardDecision(decision), this.id);
+        this._hazardLastLogKey = key;
+      }
+      return decision.qTarget;
+    } catch (e) {
+      try { log(`[hazard] computation failed: ${e.message}; falling back to maxConcurrentWorkers`, this.id); } catch {}
+      return fallback;
+    }
+  }
+
   _applyQuotaDiversity(taskGraph) {
     if (!this._isTaskGraphPlan(taskGraph) || !Array.isArray(taskGraph._tasks)) return;
     const directConfig = this.loadConfig().directExecutor || null;
@@ -3406,7 +3467,12 @@ class ProjectRunner {
     };
 
     while (this.running && !this.abortCurrentCycle) {
-      while (!replanRequested && running.length < orchestration.maxConcurrentWorkers && this.running && !this.abortCurrentCycle) {
+      // ALPS Phase 3: hazardQueueEnabled flips this from a fixed cap
+      // (orchestration.maxConcurrentWorkers) to an adaptive cap derived
+      // from the operator posterior + in-flight experiments. Disabled
+      // by default; falls back to the fixed cap.
+      const hazardCap = this._hazardQueueCap(running, orchestration);
+      while (!replanRequested && running.length < hazardCap && this.running && !this.abortCurrentCycle) {
         const runnable = [];
         for (const task of plan._tasks) {
           const state = plan._runtime.taskStates[task.id];

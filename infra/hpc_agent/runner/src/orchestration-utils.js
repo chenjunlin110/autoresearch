@@ -301,6 +301,16 @@ export function normalizeDirectExecutorConfig(input) {
     maxPerOperatorPerWake: coercePositiveInteger(source.maxPerOperatorPerWake, 4),
     maxSameOperatorValuePerWake: coercePositiveInteger(source.maxSameOperatorValuePerWake, 1),
     alwaysAllowValidation: coerceBoolean(source.alwaysAllowValidation, true),
+    // ALPS Phase 3: hazard-driven adaptive queue depth. Off by default
+    // until the operator posterior accumulates ≥ posteriorMinSamples
+    // single-edit observations per primary operator (otherwise the
+    // unreliable cap would dominate ρ and collapse Q to qMin too eagerly).
+    hazardQueueEnabled: coerceBoolean(source.hazardQueueEnabled, false),
+    qMin: coercePositiveInteger(source.qMin, 1),
+    qMax: coercePositiveInteger(source.qMax, 8),
+    hazardZeta: coerceNonNegativeFloat(source.hazardZeta, 2.0),
+    posteriorMinSamples: coercePositiveInteger(source.posteriorMinSamples, 3),
+    hazardCommitProbCap: coerceNonNegativeFloat(source.hazardCommitProbCap, 0.5),
   };
 }
 
