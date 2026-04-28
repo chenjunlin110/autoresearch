@@ -474,6 +474,12 @@ function renderDirectExecutorBlock({
   # cost of accepting ~1σ false-positive risk per KEEP.
   gateTauMin: 0.1
   gateTauMax: 0.5
+  # Phase 5: when a candidate beat its own base but HEAD has since
+  # moved (stale-baseline gate decision), framework auto-dispatches
+  # a fresh task with same edits on current HEAD. Closes the
+  # "wasted second-place" hole observed in 1583062 and 1583778
+  # where wave winners get dropped because exp_0017 KEPT first.
+  rebaseValidationEnabled: true
   manualStaleKeepPolicy: block
   autoEnqueueHeadValidation: true
   quotaDiversityEnabled: false

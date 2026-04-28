@@ -316,6 +316,12 @@ export function normalizeDirectExecutorConfig(input) {
     // more aggressively; tune per task. Defaults are conservative.
     gateTauMin: coerceNonNegativeFloat(source.gateTauMin, 0.5),
     gateTauMax: coerceNonNegativeFloat(source.gateTauMax, 2.0),
+    // Phase 5 rebase-validation: when gate decides
+    // AUTO_KEEP_REQUIRES_REBASE on a candidate that beat its own base,
+    // auto-enqueue an identical param_patch task on current HEAD.
+    // Prevents the "wasted second-place" problem where wave winners
+    // get dropped because HEAD moved while they were running.
+    rebaseValidationEnabled: coerceBoolean(source.rebaseValidationEnabled, false),
   };
 }
 

@@ -518,6 +518,10 @@ class ProjectRunner {
     // is enqueued after metricKnown flips false. Cleared on its
     // validated event. Used to suppress duplicate auto-enqueue.
     this.pendingHeadValidation = null;
+    // Phase 5: tracks original-task ids whose stale-baseline
+    // candidates have already been auto-rebased. Single attempt per
+    // origin; prevents infinite rebase chains if HEAD keeps advancing.
+    this.pendingRebaseValidations = new Set();
   }
 
   /**
@@ -2256,6 +2260,23 @@ class ProjectRunner {
 
       log(formatGateDecision(taskId, decision), this.id);
 
+      // ALPS Phase 5: auto-rebase stale-baseline candidates that beat
+      // their original base. Only enqueue when improvement_vs_base > 0
+      // — rebasing a candidate that regressed against old HEAD will
+      // regress harder against new (better) HEAD. Wasted GPU.
+      if (
+        decision.decision === GATE_DECISION.AUTO_KEEP_REQUIRES_REBASE
+        && directConfig.rebaseValidationEnabled
+      ) {
+        const baseMetric = picked?.picked_base_metric_at_pick_time;
+        if (typeof baseMetric === 'number' && Number.isFinite(baseMetric)) {
+          const improvementVsBase = baseMetric - yCandidate;
+          if (improvementVsBase > 0) {
+            this._maybeEnqueueRebaseValidation(taskId, picked);
+          }
+        }
+      }
+
       // ALPS Phase 2B: auto-apply gated on `directConfig.autoKeepEnabled`.
       // The gate already enforces the four safe-fresh conditions
       // (head_metric_known, base==head, patch applies cleanly, gate
@@ -2659,6 +2680,61 @@ class ProjectRunner {
    *
    * @private
    */
+  /**
+   * ALPS Phase 5: enqueue a synthetic rebase-validation task that
+   * re-runs the original candidate's edits on CURRENT source HEAD.
+   * Called when the commit gate returns AUTO_KEEP_REQUIRES_REBASE on
+   * a candidate that beat its own base — those would have been
+   * winners had HEAD not advanced under them.
+   *
+   * Single attempt per origin (tracked via pendingRebaseValidations);
+   * if the rebase task itself becomes stale we don't re-rebase.
+   *
+   * @private
+   */
+  _maybeEnqueueRebaseValidation(originId, originPicked) {
+    if (!originPicked || !Array.isArray(originPicked.edits) || originPicked.edits.length === 0) return;
+    if (originId.includes('__rebase')) return;
+    if (this.pendingRebaseValidations.has(originId)) return;
+    if (!this.currentSchedule || !this._isTaskGraphPlan(this.currentSchedule)) return;
+    const rebaseId = `${originId}__rebase`;
+    if (this.currentSchedule._tasks.some((t) => t.id === rebaseId)) return;
+    const synthetic = {
+      id: rebaseId,
+      type: 'agent',
+      agent: null,
+      workerClass: 'experiment_runner',
+      task: `Auto-rebase of ${originId}: original was AUTO_KEEP_REQUIRES_REBASE because source HEAD advanced while it was running. Re-run identical edits on current HEAD to validate whether the win still holds.`,
+      executionMode: 'param_patch',
+      edits: originPicked.edits,
+      baseRef: 'HEAD',
+      earlyStop: null,
+      rationale: `auto-rebase of ${originId} (HEAD was stale at original pick)`,
+      visibility: 'full',
+      resources: { gpus: 1, cpus: 1 },
+      retries: 0,
+      dependsOn: [],
+      dependsOnTags: [],
+      producesTags: [`metrics:${rebaseId}`, `rebase_of:${originId}`],
+      priority: 8,
+      utility: 1,
+      estimatedRuntimeSeconds: 320,
+      replanAfter: false,
+    };
+    this._ensureTaskGraphRuntime(this.currentSchedule);
+    this.currentSchedule._tasks.push(synthetic);
+    this.currentSchedule._runtime.taskStates[rebaseId] = {
+      status: 'pending',
+      attempts: 0,
+      startedAt: null,
+      finishedAt: null,
+      reason: null,
+    };
+    this.pendingRebaseValidations.add(originId);
+    this.saveState();
+    log(`[rebase] enqueued ${rebaseId} for stale-baseline candidate ${originId} (priority=8)`, this.id);
+  }
+
   /**
    * ALPS Phase 0/2A: dispatch the configured number of calibration
    * baseline_repeat tasks at cycle 1, before the manager's first plan
