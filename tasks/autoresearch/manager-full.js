@@ -461,10 +461,12 @@ function renderDirectExecutorBlock({
   metricKey: val_bpb
   timeBudgetSeconds: ${timeBudgetSeconds}
   hardCapSeconds: ${hardCapSeconds}
-  # ALPS knobs.
+  # ALPS knobs. Phase 2B: autoKeepEnabled=true after Phase 2A dry-run
+  # (job 1582493) confirmed [gate] decisions match expected behavior —
+  # τ decay, sign convention, HEAD-metric transfer all correct.
   fallbackSigma: 0.0005
   calibrationRepeats: 3
-  autoKeepEnabled: false
+  autoKeepEnabled: true
   manualStaleKeepPolicy: block
   autoEnqueueHeadValidation: true
   quotaDiversityEnabled: false
