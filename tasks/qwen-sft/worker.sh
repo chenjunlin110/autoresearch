@@ -52,6 +52,10 @@ train_timeout=$((SFT_TIME_BUDGET_SECONDS + SFT_TRAIN_TIMEOUT_SLACK_SECONDS))
 : "${WANDB_RUN_NAME:=$(basename "$output_dir")}"
 : "${WANDB_RUN_GROUP:=qwen-sft-default}"
 : "${WANDB_TAGS:=qwen-sft,datamix,framework}"
+# Pin wandb local cache under the experiment dir instead of letting it litter
+# the sandbox cwd. Wandb still uploads to the cloud as configured.
+: "${WANDB_DIR:=$output_dir/wandb}"
+mkdir -p "$WANDB_DIR"
 : "${EVAL_EVERY_STEPS:=200}"
 
 export SFT_TIME_BUDGET_SECONDS
@@ -63,7 +67,7 @@ export TORCHINDUCTOR_CACHE_DIR
 export QWEN_SFT_METRICS_PATH
 export OMP_NUM_THREADS
 export PYTHONUNBUFFERED=1
-export WANDB_PROJECT WANDB_ENTITY WANDB_RUN_NAME WANDB_RUN_GROUP WANDB_TAGS
+export WANDB_PROJECT WANDB_ENTITY WANDB_RUN_NAME WANDB_RUN_GROUP WANDB_TAGS WANDB_DIR
 export EVAL_EVERY_STEPS
 
 mkdir -p \

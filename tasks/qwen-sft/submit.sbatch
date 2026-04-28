@@ -90,7 +90,7 @@ node "$script_dir/create.js" \
   --project-id qwen-sft \
   --gpu-count 8 \
   --experiment-worker-count 8 \
-  --time-budget-seconds 600
+  --time-budget-seconds 1200
 
 ln -sf "$run_root/projects.yaml" "$TBC_HOME/projects.yaml"
 
