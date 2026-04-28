@@ -36,7 +36,12 @@ import { spawn, execFileSync } from 'child_process';
 import { applyEdits } from './edits.js';
 import { validateExperimentResult } from './result-validator.js';
 
-const GIT_TIMEOUT_MS = 30000;
+// 120s rather than 30s for the same reason lineage.js was bumped (commit
+// 1a75224): on weka, `git clone` for the per-experiment sandbox can take
+// >30s when 8 clones launch concurrently from cycle 1's TASK_GRAPH. Seen
+// as `spawnSync git ETIMEDOUT` against tasks/autoresearch/source/ during
+// the ALPS dry-run verification (job 1582371).
+const GIT_TIMEOUT_MS = 120000;
 const PYTHON_PARSE_TIMEOUT_MS = 15000;
 
 /**
