@@ -131,7 +131,7 @@ Minimize balanced held-out \`val_loss\` under a fixed ${timeBudgetSeconds}s SFT 
 
 ## What you change
 
-Only \`DATA_MIX\` in \`${workloadRoot}/train.py\`. Everything else (model size = Qwen3-0.6B, seq_len = 2048, micro_batch = 16, grad_accum = 1, learning_rate = 1e-5, warmup = 50, weight_decay = 0) is fixed across experiments. Don't propose to change them via \`code_edit\` — those are the controlled axes.
+Only \`DATA_MIX\` in \`${workloadRoot}/train.py\`. Everything else (model = Qwen3-0.6B, seq_len = 2048, micro_batch = 16, grad_accum = 2, effective batch = 32, learning_rate = 2e-5, warmup = 50, weight_decay = 0.01) is fixed across experiments. Don't propose to change them via \`code_edit\` — those are the controlled axes.
 
 The five buckets and their patterns are documented in \`~/.cache/qwen-sft/data/manifest.json\`. Inspect it before cycle 1 so you know each bucket's size and what's in it.
 
@@ -375,6 +375,17 @@ function renderDirectExecutorBlock({
   // Reuse the existing HF cache so Qwen3-0.6B isn't re-downloaded per run.
   const hfHome = path.join(process.env.HOME || '', '.cache', 'huggingface');
   if (process.env.HOME) envEntries.push(`    HF_HOME: ${hfHome}`);
+  // wandb: pin project/entity to this user's workshop project. WANDB_RUN_GROUP
+  // gets a per-sbatch timestamp so curves from one run share a group; the
+  // per-experiment WANDB_RUN_NAME defaults to the experiment id (set in
+  // worker.sh from the output_dir basename).
+  const wandbGroup = process.env.QWEN_SFT_WANDB_GROUP
+    || `qwen-sft-${new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`;
+  envEntries.push(`    WANDB_PROJECT: ${process.env.WANDB_PROJECT || 'workshop'}`);
+  envEntries.push(`    WANDB_ENTITY: ${process.env.WANDB_ENTITY || 'haolong'}`);
+  envEntries.push(`    WANDB_RUN_GROUP: ${wandbGroup}`);
+  envEntries.push(`    WANDB_TAGS: qwen-sft,datamix,framework`);
+  envEntries.push(`    EVAL_EVERY_STEPS: ${process.env.EVAL_EVERY_STEPS || '200'}`);
   const envLines = envEntries.length
     ? `  envOverrides:\n${envEntries.join('\n')}\n`
     : '';

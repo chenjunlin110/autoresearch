@@ -43,6 +43,17 @@ fi
 : "${SFT_TRAIN_TIMEOUT_SLACK_SECONDS:=300}"
 train_timeout=$((SFT_TIME_BUDGET_SECONDS + SFT_TRAIN_TIMEOUT_SLACK_SECONDS))
 
+# wandb defaults. WANDB_RUN_NAME = experiment id (= output_dir basename); the
+# direct executor passes the experiment id as the worker output dir, so each
+# experiment becomes one wandb run automatically. WANDB_RUN_GROUP normally
+# comes from the framework run timestamp via directExecutor.envOverrides.
+: "${WANDB_PROJECT:=workshop}"
+: "${WANDB_ENTITY:=haolong}"
+: "${WANDB_RUN_NAME:=$(basename "$output_dir")}"
+: "${WANDB_RUN_GROUP:=qwen-sft-default}"
+: "${WANDB_TAGS:=qwen-sft,datamix,framework}"
+: "${EVAL_EVERY_STEPS:=200}"
+
 export SFT_TIME_BUDGET_SECONDS
 export UV_CACHE_DIR
 export HF_HOME
@@ -52,6 +63,8 @@ export TORCHINDUCTOR_CACHE_DIR
 export QWEN_SFT_METRICS_PATH
 export OMP_NUM_THREADS
 export PYTHONUNBUFFERED=1
+export WANDB_PROJECT WANDB_ENTITY WANDB_RUN_NAME WANDB_RUN_GROUP WANDB_TAGS
+export EVAL_EVERY_STEPS
 
 mkdir -p \
   "$UV_CACHE_DIR" \
@@ -78,6 +91,11 @@ fi
   echo "sft_time_budget_seconds=$SFT_TIME_BUDGET_SECONDS"
   echo "train_timeout_seconds=$train_timeout"
   echo "qwen_sft_metrics_path=$QWEN_SFT_METRICS_PATH"
+  echo "wandb_project=$WANDB_PROJECT"
+  echo "wandb_entity=$WANDB_ENTITY"
+  echo "wandb_run_name=$WANDB_RUN_NAME"
+  echo "wandb_run_group=$WANDB_RUN_GROUP"
+  echo "eval_every_steps=$EVAL_EVERY_STEPS"
   printf "command="
   printf "%q " "${cmd[@]}"
   echo
