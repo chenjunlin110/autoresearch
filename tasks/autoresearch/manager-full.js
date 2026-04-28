@@ -467,6 +467,13 @@ function renderDirectExecutorBlock({
   fallbackSigma: 0.0005
   calibrationRepeats: 3
   autoKeepEnabled: true
+  # τ schedule for commit gate. Default 0.5/2.0 was too conservative
+  # for autoresearch's σ̂≈3e-3 at 300s budget — gate would never fire
+  # because no real improvement is ≥ τ·σ̂ within seed noise. Lower
+  # values commit more aggressively (Karpathy-serial-style) at the
+  # cost of accepting ~1σ false-positive risk per KEEP.
+  gateTauMin: 0.3
+  gateTauMax: 1.0
   manualStaleKeepPolicy: block
   autoEnqueueHeadValidation: true
   quotaDiversityEnabled: false

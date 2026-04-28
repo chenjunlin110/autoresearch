@@ -2250,6 +2250,8 @@ class ProjectRunner {
         currentHeadCommit: this.currentHeadCommit,
         patchAppliesCleanly: true,
         fallbackSigmaHat: typeof directConfig.fallbackSigma === 'number' ? directConfig.fallbackSigma : 0.0005,
+        tauMin: typeof directConfig.gateTauMin === 'number' ? directConfig.gateTauMin : 0.5,
+        tauMax: typeof directConfig.gateTauMax === 'number' ? directConfig.gateTauMax : 2.0,
       });
 
       log(formatGateDecision(taskId, decision), this.id);

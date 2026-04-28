@@ -311,6 +311,11 @@ export function normalizeDirectExecutorConfig(input) {
     hazardZeta: coerceNonNegativeFloat(source.hazardZeta, 2.0),
     posteriorMinSamples: coercePositiveInteger(source.posteriorMinSamples, 3),
     hazardCommitProbCap: coerceNonNegativeFloat(source.hazardCommitProbCap, 0.5),
+    // Commit-gate τ schedule. threshold = τ·σ̂ where τ decays from
+    // τ_max (start of run) to τ_min (deadline). Lower values commit
+    // more aggressively; tune per task. Defaults are conservative.
+    gateTauMin: coerceNonNegativeFloat(source.gateTauMin, 0.5),
+    gateTauMax: coerceNonNegativeFloat(source.gateTauMax, 2.0),
   };
 }
 
