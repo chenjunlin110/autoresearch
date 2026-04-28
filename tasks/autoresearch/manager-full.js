@@ -472,8 +472,8 @@ function renderDirectExecutorBlock({
   # because no real improvement is ≥ τ·σ̂ within seed noise. Lower
   # values commit more aggressively (Karpathy-serial-style) at the
   # cost of accepting ~1σ false-positive risk per KEEP.
-  gateTauMin: 0.3
-  gateTauMax: 1.0
+  gateTauMin: 0.1
+  gateTauMax: 0.5
   manualStaleKeepPolicy: block
   autoEnqueueHeadValidation: true
   quotaDiversityEnabled: false
