@@ -387,6 +387,27 @@ function renderDirectExecutorBlock({
   metricKey: val_loss
   timeBudgetSeconds: ${timeBudgetSeconds}
   hardCapSeconds: ${hardCapSeconds}
+  # ALPS knobs. calibrationRepeats=0 because each evaluation is ~10 min;
+  # noise floor falls back to the constant below until online (op,value)
+  # repeats refine it.
+  fallbackSigma: 0.005
+  calibrationRepeats: 0
+  autoKeepEnabled: false
+  manualStaleKeepPolicy: block
+  autoEnqueueHeadValidation: true
+  quotaDiversityEnabled: false
+  maxPerOperatorPerWake: 4
+  maxSameOperatorValuePerWake: 1
+  alwaysAllowValidation: true
+  searchAxes:
+    - name: BUCKET_MIX
+      role: primary
+    - name: LR
+      role: primary
+    - name: WARMUP_RATIO
+      role: schedule
+    - name: WEIGHT_DECAY
+      role: primary
 ${envLines}`;
 }
 

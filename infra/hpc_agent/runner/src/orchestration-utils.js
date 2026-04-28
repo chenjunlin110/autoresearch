@@ -59,7 +59,11 @@ function normalizeVisibility(value) {
   return 'full';
 }
 
-const VALID_EXECUTION_MODES = new Set(['code_edit', 'param_patch', 'llm_repair']);
+// `baseline_repeat` is a no-edit harness call used by the noise estimator
+// (and by auto HEAD-validation after a manual multi-keep). It gets a fresh
+// PRNG seed via the wrapper's *_SEED env var; its observed-metric spread
+// across repeats is the seed-noise floor σ̂.
+const VALID_EXECUTION_MODES = new Set(['code_edit', 'param_patch', 'llm_repair', 'baseline_repeat']);
 
 function normalizeExecutionMode(value) {
   if (value === undefined || value === null) return 'code_edit';
@@ -231,6 +235,34 @@ export function normalizeDirectExecutorConfig(input) {
       .filter((entry) => typeof entry === 'string' && entry.trim())
       .map((entry) => entry.trim());
   }
+
+  // ALPS scheduler config. searchAxes is the registry of operator names
+  // the task plugin expects the manager to explore. Without it the
+  // runtime can't tell "axis never tested" from "axis touched". role is
+  // free-form (e.g. "primary", "schedule"); the runtime preserves it
+  // for the manifest renderer but doesn't act on it.
+  let searchAxes = [];
+  if (Array.isArray(source.searchAxes)) {
+    for (const entry of source.searchAxes) {
+      if (typeof entry === 'string' && entry.trim()) {
+        searchAxes.push({ name: entry.trim(), role: 'primary' });
+      } else if (entry && typeof entry === 'object' && typeof entry.name === 'string' && entry.name.trim()) {
+        searchAxes.push({
+          name: entry.name.trim(),
+          role: typeof entry.role === 'string' && entry.role.trim() ? entry.role.trim() : 'primary',
+        });
+      }
+    }
+  }
+
+  // manualStaleKeepPolicy: "block" (default) refuses a manual KEEP whose
+  // baseCommit is not current HEAD. "warn" applies it but marks
+  // metricKnown=false and logs a banner.
+  const rawPolicy = typeof source.manualStaleKeepPolicy === 'string'
+    ? source.manualStaleKeepPolicy.trim().toLowerCase()
+    : '';
+  const manualStaleKeepPolicy = rawPolicy === 'warn' ? 'warn' : 'block';
+
   return {
     enabled: true,
     sourceRepoPath: source.sourceRepoPath.trim(),
@@ -243,6 +275,32 @@ export function normalizeDirectExecutorConfig(input) {
     hardCapSeconds: coercePositiveInteger(source.hardCapSeconds, 900),
     envOverrides: env,
     managerContextFiles: contextFiles,
+    searchAxes,
+    // Per-task noise floor used when calibration hasn't produced an
+    // estimate yet. Logged on every commit-gate decision via the
+    // sigmaHatSource field so the user can audit which value was in
+    // effect.
+    fallbackSigma: coerceNonNegativeFloat(source.fallbackSigma, 0.0005),
+    // How many baseline_repeat tasks to dispatch at the start of cycle
+    // 1 to estimate the noise floor from observed seed-to-seed spread.
+    // Set to 0 for tasks where each evaluation is too expensive to
+    // afford 3× repeats up front.
+    calibrationRepeats: coerceNonNegativeInteger(source.calibrationRepeats, 0),
+    // Master switch: when true, the runtime applies KEEP_EXPERIMENT
+    // automatically for any candidate that passes the safety rules and
+    // the gate. False keeps the gate in dry-run logging mode only.
+    autoKeepEnabled: coerceBoolean(source.autoKeepEnabled, false),
+    manualStaleKeepPolicy,
+    // When metricKnown becomes false (multi-keep block, stale manual
+    // keep, etc.) the runtime enqueues a baseline_repeat at HIGHEST
+    // priority to re-validate HEAD before the gate re-engages.
+    autoEnqueueHeadValidation: coerceBoolean(source.autoEnqueueHeadValidation, true),
+    // Cross-axis diversity filter (Phase 4); off by default until
+    // Phase 2A logs are vetted.
+    quotaDiversityEnabled: coerceBoolean(source.quotaDiversityEnabled, false),
+    maxPerOperatorPerWake: coercePositiveInteger(source.maxPerOperatorPerWake, 4),
+    maxSameOperatorValuePerWake: coercePositiveInteger(source.maxSameOperatorValuePerWake, 1),
+    alwaysAllowValidation: coerceBoolean(source.alwaysAllowValidation, true),
   };
 }
 
@@ -430,7 +488,7 @@ export function parseTaskGraphDocument(resultText, defaultWorkerResources = DEFA
     }
     const executionMode = normalizeExecutionMode(task.execution_mode ?? task.executionMode);
     if (executionMode === null) {
-      pushError(`${pos} (${id}): invalid execution_mode (must be code_edit, param_patch, or llm_repair)`);
+      pushError(`${pos} (${id}): invalid execution_mode (must be code_edit, param_patch, llm_repair, or baseline_repeat)`);
       return null;
     }
     let edits = null;
@@ -439,7 +497,11 @@ export function parseTaskGraphDocument(resultText, defaultWorkerResources = DEFA
       pushError(`${pos} (${id}): execution_mode=param_patch requires non-empty "edits"`);
       return null;
     }
-    if (editsProvided) {
+    if (executionMode === 'baseline_repeat' && editsProvided && Array.isArray(task.edits) && task.edits.length > 0) {
+      pushError(`${pos} (${id}): execution_mode=baseline_repeat cannot have edits; the harness runs unmodified on a fresh seed`);
+      return null;
+    }
+    if (editsProvided && Array.isArray(task.edits) && task.edits.length > 0) {
       const editError = validateEdits(task.edits);
       if (editError) {
         pushError(`${pos} (${id}): ${editError}`);

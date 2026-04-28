@@ -253,6 +253,8 @@ Multiple wins along independent axes can go in a single \`KEEP_EXPERIMENT\` bloc
 
 **Don't KEEP**: regressions, crashes, no-edit baselines (the source already has them), or wins so small you'd describe them yourself as "could be the seed".
 
+**ALPS auto-keep (when \`autoKeepEnabled: true\` in config):** the runtime auto-applies KEEP_EXPERIMENT for any candidate that beats current HEAD by more than the noise-aware gate threshold τ·σ̂ (logged as \`[gate] WOULD_AUTO_KEEP\` / \`AUTO_KEEP\`). When auto-keep is on, your manual \`KEEP_EXPERIMENT\` is reserved for sub-threshold wins where you have a strong qualitative reason. **Stale manual KEEPs are blocked**: if your KEEP target's baseline is no longer current HEAD (visible in the picked event's \`picked_base_commit\`), the runtime refuses the keep — re-dispatch the same edits with \`base_ref: "HEAD"\` to re-validate on the new baseline. To dispatch a no-edit baseline_repeat (which re-establishes HEAD metric so the gate can engage), set \`execution_mode: "baseline_repeat"\` and \`base_ref: "HEAD"\` with no \`edits\`.
+
 When to UN-KEEP (rewind): there's no automatic primitive for this — if a kept experiment turns out to have been a fluke, you can effectively rewind by KEEPing the LATER version of that file (i.e., emit a \`code_edit\` task that produces the desired source state and then KEEP it, or just live with the slight regression and find new wins on top).
 
 \`KEEP_EXPERIMENT\` runs **before** any new TASK_GRAPH in the same response is parsed, so you can KEEP an old experiment and immediately emit new tasks that build on it in the same manager response.
@@ -459,6 +461,29 @@ function renderDirectExecutorBlock({
   metricKey: val_bpb
   timeBudgetSeconds: ${timeBudgetSeconds}
   hardCapSeconds: ${hardCapSeconds}
+  # ALPS knobs.
+  fallbackSigma: 0.0005
+  calibrationRepeats: 3
+  autoKeepEnabled: false
+  manualStaleKeepPolicy: block
+  autoEnqueueHeadValidation: true
+  quotaDiversityEnabled: false
+  maxPerOperatorPerWake: 4
+  maxSameOperatorValuePerWake: 1
+  alwaysAllowValidation: true
+  searchAxes:
+    - name: ASPECT_RATIO
+      role: primary
+    - name: DEPTH
+      role: primary
+    - name: MATRIX_LR
+      role: primary
+    - name: EMBEDDING_LR
+      role: primary
+    - name: WARMDOWN_RATIO
+      role: schedule
+    - name: WEIGHT_DECAY
+      role: primary
 ${envLines}${ctxBlock}`;
 }
 

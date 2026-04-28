@@ -495,8 +495,13 @@ if not torch.cuda.is_available():
     raise RuntimeError("autoresearch requires CUDA. Run inside the shared allocation or a GPU-enabled shell.")
 
 t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+# Seed override for ALPS noise calibration. baseline_repeat tasks
+# dispatch with no edits but a varying AUTORESEARCH_SEED so seed-to-seed
+# spread of val_bpb gives an honest run-to-run noise estimate. Without
+# the env var, the seed stays fixed at 42 (the historical default).
+_seed = int(os.environ.get("AUTORESEARCH_SEED", "42"))
+torch.manual_seed(_seed)
+torch.cuda.manual_seed(_seed)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)

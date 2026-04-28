@@ -65,26 +65,112 @@ function gitSilent(args, cwd) {
  * @return {Lineage}
  */
 export function readLineage(lineagePath) {
-  if (!lineagePath) return { task: null, entries: [], current_head_commit: null };
+  const empty = {
+    task: null,
+    entries: [],
+    current_head_commit: null,
+    // ALPS HEAD-metric tracking. metric_known=false disables the
+    // commit gate until a baseline_repeat (or no-edit experiment)
+    // re-establishes the metric.
+    current_head_metric_known: false,
+    current_head_metric: null,
+    current_head_metric_source_experiment: null,
+  };
+  if (!lineagePath) return empty;
   try {
     const raw = fs.readFileSync(lineagePath, 'utf-8');
     const doc = JSON.parse(raw);
-    if (!doc || typeof doc !== 'object') return { task: null, entries: [], current_head_commit: null };
+    if (!doc || typeof doc !== 'object') return empty;
     return {
       task: doc.task ?? null,
       entries: Array.isArray(doc.entries) ? doc.entries : [],
       current_head_commit: doc.current_head_commit ?? null,
+      current_head_metric_known: doc.current_head_metric_known === true,
+      current_head_metric: typeof doc.current_head_metric === 'number'
+        && Number.isFinite(doc.current_head_metric) ? doc.current_head_metric : null,
+      current_head_metric_source_experiment: typeof doc.current_head_metric_source_experiment === 'string'
+        ? doc.current_head_metric_source_experiment : null,
     };
   } catch {
-    return { task: null, entries: [], current_head_commit: null };
+    return empty;
   }
 }
 
-function writeLineage(lineagePath, doc) {
+export function writeLineage(lineagePath, doc) {
   fs.mkdirSync(path.dirname(lineagePath), { recursive: true });
   const tmp = `${lineagePath}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + '\n');
   fs.renameSync(tmp, lineagePath);
+}
+
+/**
+ * Update HEAD-metric tracking on the lineage file without touching
+ * entries. Used by the framework's head-state setter so
+ * `currentHeadMetricKnown` survives a runner restart.
+ *
+ * @param {string} lineagePath
+ * @param {{
+ *   commit?: string|null,
+ *   metricKnown: boolean,
+ *   metric?: number|null,
+ *   sourceExperiment?: string|null,
+ * }} headState
+ */
+export function persistHeadState(lineagePath, headState) {
+  if (!lineagePath) return;
+  const lineage = readLineage(lineagePath);
+  if (headState.commit !== undefined) {
+    lineage.current_head_commit = headState.commit;
+  }
+  lineage.current_head_metric_known = headState.metricKnown === true;
+  lineage.current_head_metric = lineage.current_head_metric_known
+    ? (typeof headState.metric === 'number' ? headState.metric : null)
+    : null;
+  lineage.current_head_metric_source_experiment = lineage.current_head_metric_known
+    ? (typeof headState.sourceExperiment === 'string' ? headState.sourceExperiment : null)
+    : null;
+  writeLineage(lineagePath, lineage);
+}
+
+/**
+ * Compare two structured edit arrays for exact equality. Used by the
+ * `evaluateKeepMetricValidity` helper in server.js to confirm the edits
+ * we just applied match what the candidate ran with — necessary
+ * condition for transferring the candidate's metric to the new HEAD.
+ *
+ * Compares by edit kind and kind-relevant fields; ignores extra fields
+ * the parser may have added.
+ *
+ * @param {Array<Object>|null|undefined} a
+ * @param {Array<Object>|null|undefined} b
+ * @return {boolean}
+ */
+export function editsEqual(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const ea = a[i];
+    const eb = b[i];
+    if (!ea || !eb || typeof ea !== 'object' || typeof eb !== 'object') return false;
+    if (ea.file !== eb.file) return false;
+    if (ea.kind !== eb.kind) return false;
+    if (ea.kind === 'constant_replace') {
+      if (ea.name !== eb.name) return false;
+      if (ea.expected_old_repr !== eb.expected_old_repr) return false;
+      if (ea.new_repr !== eb.new_repr) return false;
+    } else if (ea.kind === 'regex_replace') {
+      if (ea.pattern !== eb.pattern) return false;
+      if (ea.replacement !== eb.replacement) return false;
+      if ((ea.expected_count ?? null) !== (eb.expected_count ?? null)) return false;
+    } else if (ea.kind === 'block_replace') {
+      if (ea.anchor_regex !== eb.anchor_regex) return false;
+      if (ea.end_regex !== eb.end_regex) return false;
+      if (ea.new_text !== eb.new_text) return false;
+    } else if (ea.kind === 'unified_diff') {
+      if (ea.diff !== eb.diff) return false;
+    }
+  }
+  return true;
 }
 
 /**

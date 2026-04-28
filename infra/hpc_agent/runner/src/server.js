@@ -48,13 +48,17 @@ import { extractOutputDirFromTaskBody, validateExperimentResult } from './result
 import { remainingWalltimeMs } from './slurm-walltime.js';
 import { buildCycleReport, formatCycleReportLine, writeCycleReport } from './cycle-report.js';
 import { listComputeProcesses } from './gpu-probe.js';
-import { runDirectTask } from './direct-executor.js';
+import { runDirectTask, resolveCommitSha } from './direct-executor.js';
 import {
   buildExperimentLedger,
   computeEditConfidence,
   formatLedgerMarkdown,
 } from './experiment-ledger.js';
-import { applyKeepExperiment, formatLineageMarkdown, readLineage } from './lineage.js';
+import { applyKeepExperiment, formatLineageMarkdown, readLineage, persistHeadState } from './lineage.js';
+import { buildOperatorPosterior, formatCoverageMarkdown } from './operator-posterior.js';
+import { shouldCommit, formatGateDecision, DECISION as GATE_DECISION } from './commit-gate.js';
+import { estimateNoise } from './noise-estimator.js';
+import { applyDiversityQuota } from './quota-diversity.js';
 import { readTaskEvents, taskEventsPath } from './task-events.js';
 import { listSessions as chatListSessions, createSession as chatCreateSession, getSession as chatGetSession, deleteSession as chatDeleteSession, updateSessionPreferences as chatUpdateSessionPreferences, streamChatMessage, getActiveStream, isStreaming as isChatStreaming, saveMessage as chatSaveMessage } from './chat.js';
 import { resolveModel, callModel, buildUserMessage, getModels as getPiModels } from './providers/index.js';
@@ -500,6 +504,19 @@ class ProjectRunner {
     this.nextRunId = 1;
     this.currentRunId = null;
     this._repo = null;
+    // ALPS HEAD-metric state. Populated lazily when the lineage / first
+    // experiment lands; persisted to lineage.json so a runner restart
+    // recovers it. The four-tuple is the source of truth for whether
+    // the commit gate is enabled — gate is DISABLED while
+    // currentHeadMetricKnown is false.
+    this.currentHeadCommit = null;
+    this.currentHeadMetricKnown = false;
+    this.currentHeadMetric = null;
+    this.currentHeadMetricSourceExperiment = null;
+    // Pending HEAD validation: set to a baseline_repeat task id when one
+    // is enqueued after metricKnown flips false. Cleared on its
+    // validated event. Used to suppress duplicate auto-enqueue.
+    this.pendingHeadValidation = null;
   }
 
   /**
@@ -1869,9 +1886,32 @@ class ProjectRunner {
         const lineage = readLineage(path.join(this.projectDir, 'lineage.json'));
         const md = formatLineageMarkdown(lineage);
         if (md) lines.push('', md);
+        // ALPS Phase 0/1: HEAD-metric status banner. Tells the manager
+        // whether the commit gate is enabled, and if not, why.
+        const headBanner = this._formatHeadStatusMarkdown(lineage);
+        if (headBanner) lines.push('', headBanner);
       }
     } catch (e) {
       try { log(`Lineage render failed: ${e.message}`, this.id); } catch {}
+    }
+
+    // ALPS Phase 1: per-operator coverage manifest. Lets the manager see
+    // axis-level history (μ/σ of improvement, values tried, never-tested
+    // axes from the searchAxes registry) without re-reading task events
+    // by hand.
+    try {
+      const directConfig = config?.directExecutor || null;
+      if (directConfig?.enabled) {
+        const metricKey = directConfig?.metricKey || 'val_bpb';
+        const posterior = buildOperatorPosterior({
+          eventsDir: this.taskEventsDir,
+          metricKey,
+        });
+        const md = formatCoverageMarkdown(posterior, directConfig.searchAxes || [], { lowerIsBetter: true });
+        if (md) lines.push('', md);
+      }
+    } catch (e) {
+      try { log(`Coverage manifest render failed: ${e.message}`, this.id); } catch {}
     }
 
     // Source-file injection: lets the manager actually READ the current
@@ -2017,6 +2057,284 @@ class ProjectRunner {
    * @param {Array<{id: string, reason?: string}>} keepEntries
    * @return {number}
    */
+  /**
+   * ALPS Phase 0: lazy initialization of HEAD state. Reads lineage.json
+   * if present (so we recover state across runner restarts); otherwise
+   * resolves source/HEAD via git rev-parse and leaves metricKnown=false
+   * (the gate stays disabled until the first baseline_repeat lands).
+   *
+   * Idempotent — safe to call from every picked-event hook.
+   *
+   * @private
+   * @param {Object} directConfig  the directExecutor config block
+   */
+  _ensureHeadStateInitialized(directConfig) {
+    if (this._headStateInitialized) return;
+    const sourceRepoPath = directConfig?.sourceRepoPath;
+    if (!sourceRepoPath) return;
+    const lineagePath = path.join(this.projectDir, 'lineage.json');
+    let restored = false;
+    try {
+      const lineage = readLineage(lineagePath);
+      if (lineage.current_head_commit) {
+        this.currentHeadCommit = lineage.current_head_commit;
+        this.currentHeadMetricKnown = lineage.current_head_metric_known === true;
+        this.currentHeadMetric = typeof lineage.current_head_metric === 'number'
+          ? lineage.current_head_metric : null;
+        this.currentHeadMetricSourceExperiment = typeof lineage.current_head_metric_source_experiment === 'string'
+          ? lineage.current_head_metric_source_experiment : null;
+        restored = true;
+      }
+    } catch {
+      // fall through to rev-parse
+    }
+    if (!restored) {
+      try {
+        const sha = resolveCommitSha(sourceRepoPath, 'HEAD');
+        if (sha) {
+          this.currentHeadCommit = sha;
+          this.currentHeadMetricKnown = false;
+          this.currentHeadMetric = null;
+          this.currentHeadMetricSourceExperiment = null;
+        }
+      } catch {
+        // leave fields null; the picked-event lookup tolerates that
+      }
+    }
+    this._headStateInitialized = true;
+  }
+
+  /**
+   * ALPS Phase 0: centralized HEAD-state mutation. All transitions go
+   * through here so persistence + the pending-validation invariant stay
+   * coherent.
+   *
+   * @private
+   * @param {{commit?: string|null, metricKnown: boolean, metric?: number|null, sourceExperiment?: string|null}} headState
+   */
+  _setHeadState(headState) {
+    if (headState.commit !== undefined) {
+      this.currentHeadCommit = headState.commit;
+    }
+    const wasKnown = this.currentHeadMetricKnown;
+    this.currentHeadMetricKnown = headState.metricKnown === true;
+    this.currentHeadMetric = this.currentHeadMetricKnown
+      ? (typeof headState.metric === 'number' ? headState.metric : null)
+      : null;
+    this.currentHeadMetricSourceExperiment = this.currentHeadMetricKnown
+      ? (typeof headState.sourceExperiment === 'string' ? headState.sourceExperiment : null)
+      : null;
+    if (this.currentHeadMetricKnown) {
+      // Validation just landed; clear any pending baseline_repeat marker.
+      this.pendingHeadValidation = null;
+    }
+    try {
+      const lineagePath = path.join(this.projectDir, 'lineage.json');
+      persistHeadState(lineagePath, {
+        commit: this.currentHeadCommit,
+        metricKnown: this.currentHeadMetricKnown,
+        metric: this.currentHeadMetric,
+        sourceExperiment: this.currentHeadMetricSourceExperiment,
+      });
+    } catch (e) {
+      log(`[head-state] persist failed: ${e.message}`, this.id);
+    }
+    if (wasKnown && !this.currentHeadMetricKnown) {
+      log(`[head-state] metricKnown flipped to false (commit=${this.currentHeadCommit?.slice(0, 7) || 'null'}); commit gate DISABLED until baseline_repeat lands`, this.id);
+    } else if (!wasKnown && this.currentHeadMetricKnown) {
+      log(`[head-state] metric established: commit=${this.currentHeadCommit?.slice(0, 7) || 'null'} metric=${this.currentHeadMetric} src=${this.currentHeadMetricSourceExperiment}`, this.id);
+    }
+  }
+
+  /**
+   * ALPS Phase 0: resolve the metric we believe `baseCommit` has *at this
+   * moment*. Used at pick time to pin the baseline metric into the picked
+   * event so the operator posterior + commit gate don't have to consult
+   * current HEAD retroactively.
+   *
+   * Returns `{metric: number|null, source: string}` where source is one
+   * of: "head_at_pick" (using currentHeadMetric because base==head),
+   * "lineage_entry" (looked up the SHA in lineage entries — not yet
+   * implemented; reserved for future safe-fresh-auto-KEEP transfer
+   * audit), or "unknown" (no record).
+   *
+   * @private
+   */
+  /**
+   * ALPS Phase 2A: evaluate the commit gate against a freshly-validated
+   * experiment and log what it would do. **No state mutation.** Phase 2B
+   * adds the auto-apply path behind `autoKeepEnabled`.
+   *
+   * @private
+   * @param {string} taskId
+   * @param {Object} verdict  the canonical validate result
+   */
+  _logCommitGateDecision(taskId, verdict) {
+    try {
+      const directConfig = this.loadConfig().directExecutor || null;
+      if (!directConfig?.enabled) return;
+      const metricKey = directConfig.metricKey || 'val_bpb';
+      const yCandidate = verdict?.metrics?.[metricKey];
+      if (typeof yCandidate !== 'number' || !Number.isFinite(yCandidate)) return;
+      // Only run the gate on canonical successes — failures are not
+      // candidates for auto-keep.
+      if (!verdict?.success) return;
+
+      this._ensureHeadStateInitialized(directConfig);
+
+      // Look up this task's picked event for base-commit + edits.
+      const events = readTaskEvents(this.taskEventsDir, taskId);
+      const picked = (events?.events || []).find((e) => e.name === 'picked');
+      const candidateBaseCommit = picked?.picked_base_commit || null;
+      // For non-param_patch experiments (e.g., baseline_repeat) there's
+      // nothing to KEEP; skip.
+      if (picked?.execution_mode !== 'param_patch') {
+        if (picked?.execution_mode === 'baseline_repeat') {
+          // baseline_repeat establishes HEAD metric (when on HEAD); pick
+          // it up here so subsequent picks see metricKnown=true.
+          if (
+            candidateBaseCommit
+            && this.currentHeadCommit
+            && candidateBaseCommit === this.currentHeadCommit
+            && !this.currentHeadMetricKnown
+          ) {
+            this._setHeadState({
+              commit: this.currentHeadCommit,
+              metricKnown: true,
+              metric: yCandidate,
+              sourceExperiment: taskId,
+            });
+          }
+        }
+        return;
+      }
+      if (!Array.isArray(picked?.edits) || picked.edits.length === 0) return;
+
+      const noise = estimateNoise({
+        eventsDir: this.taskEventsDir,
+        metricKey,
+        fallbackSigma: typeof directConfig.fallbackSigma === 'number' ? directConfig.fallbackSigma : 0.0005,
+      });
+
+      // Time-decreasing τ context. If no Slurm deadline, the gate uses
+      // tau_min throughout (frac=0 ⇒ tau=tauMin), which is the
+      // conservative end of the schedule.
+      if (this._gateWallStartMs == null) this._gateWallStartMs = Date.now();
+      const remaining = remainingWalltimeMs();
+      let tTotalMs = 0;
+      let tRemainingMs = 0;
+      if (remaining != null) {
+        tRemainingMs = remaining;
+        const deadline = this._gateWallStartMs + remaining + (Date.now() - this._gateWallStartMs);
+        tTotalMs = Math.max(remaining, deadline - this._gateWallStartMs);
+      }
+
+      const decision = shouldCommit({
+        yCandidate,
+        yHead: this.currentHeadMetricKnown ? this.currentHeadMetric : null,
+        sigmaHat: noise.sigmaHat,
+        sigmaHatSource: noise.source,
+        sigmaHatSamples: noise.samples,
+        tRemainingMs,
+        tTotalMs,
+        numStaleWorkers: 0,
+        candidateBaseCommit,
+        currentHeadCommit: this.currentHeadCommit,
+        patchAppliesCleanly: true,
+        fallbackSigmaHat: typeof directConfig.fallbackSigma === 'number' ? directConfig.fallbackSigma : 0.0005,
+      });
+
+      log(formatGateDecision(taskId, decision), this.id);
+
+      // ALPS Phase 2B: auto-apply gated on `directConfig.autoKeepEnabled`.
+      // The gate already enforces the four safe-fresh conditions
+      // (head_metric_known, base==head, patch applies cleanly, gate
+      // passed); we apply only when decision == AUTO_KEEP.
+      if (decision.decision !== GATE_DECISION.AUTO_KEEP) return;
+      if (!directConfig.autoKeepEnabled) return;
+
+      const previousHeadCommit = this.currentHeadCommit;
+      const lineagePath = path.join(this.projectDir, 'lineage.json');
+      const reason = `auto-keep: Δ=${decision.improvement?.toExponential(3)} > τ·σ̂=${decision.threshold?.toExponential(3)} (source=${decision.sigmaHatSource})`;
+      const result = applyKeepExperiment({
+        sourceRepoPath: directConfig.sourceRepoPath,
+        lineagePath,
+        taskName: this.id,
+        experimentId: taskId,
+        reason,
+        edits: picked.edits,
+      });
+      if (!result.ok) {
+        log(`[gate] auto-keep ${taskId} FAILED: ${result.reason}`, this.id);
+        return;
+      }
+      if (result.alreadyKept) {
+        log(`[gate] auto-keep ${taskId}: already kept (no-op)`, this.id);
+        return;
+      }
+      // Safe-fresh transfer: candidate ran on previousHeadCommit with the
+      // exact edit set we just re-applied to source HEAD; the new HEAD's
+      // source state is byte-identical to the candidate's evaluated
+      // state. Therefore candidate.metric IS the new HEAD metric.
+      log(`[gate] auto-keep applied ${taskId}: source/HEAD ${previousHeadCommit?.slice(0, 7) || 'null'} → ${result.commit.slice(0, 7)}`, this.id);
+      this._setHeadState({
+        commit: result.commit,
+        metricKnown: true,
+        metric: yCandidate,
+        sourceExperiment: taskId,
+      });
+    } catch (e) {
+      try { log(`[gate] decision crashed for ${taskId}: ${e.message}`, this.id); } catch {}
+    }
+  }
+
+  /**
+   * ALPS Phase 0/1: render a one-block summary of HEAD metric state for
+   * injection into the manager prompt. Tells the manager whether the
+   * commit gate is enabled, and if not, why.
+   *
+   * @private
+   * @param {Object} lineage  the parsed lineage doc (for SHA fallback)
+   * @return {string}
+   */
+  _formatHeadStatusMarkdown(lineage) {
+    // Prefer in-memory state (post-init); fall back to lineage doc.
+    const commit = this.currentHeadCommit
+      || (lineage && lineage.current_head_commit) || null;
+    const known = this._headStateInitialized
+      ? this.currentHeadMetricKnown === true
+      : (lineage && lineage.current_head_metric_known === true);
+    const metric = this._headStateInitialized
+      ? this.currentHeadMetric
+      : (lineage && typeof lineage.current_head_metric === 'number' ? lineage.current_head_metric : null);
+    const src = this._headStateInitialized
+      ? this.currentHeadMetricSourceExperiment
+      : (lineage && lineage.current_head_metric_source_experiment) || null;
+    if (!commit) return '';
+    const sha = commit.slice(0, 7);
+    if (known && typeof metric === 'number' && Number.isFinite(metric)) {
+      return `> **HEAD metric:** known; commit=${sha}; metric=${metric.toFixed(4)}${src ? ` (from ${src})` : ''}.`;
+    }
+    return [
+      `> **⚠ HEAD metric is currently unknown** — commit=${sha} has not been measured by a baseline_repeat or fresh-safe auto-KEEP yet.`,
+      '> The commit gate is **DISABLED** until a `baseline_repeat` task lands on HEAD. Issue one (`execution_mode: "baseline_repeat", base_ref: "HEAD"`) or wait for the runtime to auto-enqueue one.',
+    ].join('\n');
+  }
+
+  _lookupBaseMetricAtPickTime(baseCommit) {
+    if (!baseCommit) return { metric: null, source: 'unknown' };
+    if (
+      this.currentHeadMetricKnown
+      && this.currentHeadCommit
+      && baseCommit === this.currentHeadCommit
+      && typeof this.currentHeadMetric === 'number'
+      && Number.isFinite(this.currentHeadMetric)
+    ) {
+      return { metric: this.currentHeadMetric, source: 'head_at_pick' };
+    }
+    return { metric: null, source: 'unknown' };
+  }
+
   _handleKeepExperiments(keepEntries) {
     if (!Array.isArray(keepEntries) || keepEntries.length === 0) return 0;
     const directConfig = this.loadConfig().directExecutor || null;
@@ -2024,8 +2342,16 @@ class ProjectRunner {
       log('KEEP_EXPERIMENT ignored: directExecutor not configured for this project', this.id);
       return 0;
     }
+    this._ensureHeadStateInitialized(directConfig);
+    const policy = directConfig.manualStaleKeepPolicy === 'warn' ? 'warn' : 'block';
+    const metricKey = directConfig.metricKey || 'val_bpb';
     const lineagePath = path.join(this.projectDir, 'lineage.json');
     let kept = 0;
+    // ALPS: a single <!-- KEEP_EXPERIMENT --> block listing ≥2 entries
+    // composes their edits, but the composed patch's metric was never
+    // measured. We can't transfer any single candidate's metric to the
+    // new HEAD in that case.
+    const isMultiKeepBlock = keepEntries.length > 1;
     for (const entry of keepEntries) {
       const taskId = entry.id;
       const events = readTaskEvents(this.taskEventsDir, taskId);
@@ -2039,6 +2365,19 @@ class ProjectRunner {
         log(`KEEP_EXPERIMENT ${taskId}: not a param_patch experiment (no edits in picked event)`, this.id);
         continue;
       }
+      // Manual stale-KEEP guarding: candidate's baseline differs from
+      // current source HEAD. Default policy is "block" — refuse and
+      // tell the manager to dispatch the same edits on `base_ref:
+      // HEAD`. Policy "warn" applies but flips metricKnown=false.
+      const candidateBaseCommit = picked.picked_base_commit || null;
+      const isStale = candidateBaseCommit
+        && this.currentHeadCommit
+        && candidateBaseCommit !== this.currentHeadCommit;
+      if (isStale && policy === 'block') {
+        log(`MANUAL_STALE_KEEP_BLOCKED exp=${taskId} base=${candidateBaseCommit.slice(0, 7)} head=${this.currentHeadCommit.slice(0, 7)} — re-dispatch on base_ref:HEAD instead`, this.id);
+        continue;
+      }
+      const previousHeadCommit = this.currentHeadCommit;
       const result = applyKeepExperiment({
         sourceRepoPath: directConfig.sourceRepoPath,
         lineagePath,
@@ -2053,9 +2392,42 @@ class ProjectRunner {
       }
       if (result.alreadyKept) {
         log(`KEEP_EXPERIMENT ${taskId}: already kept (no-op)`, this.id);
+        continue;
+      }
+      log(`KEEP_EXPERIMENT ${taskId}: source/ advanced to ${result.commit.slice(0, 7)}${entry.reason ? ` — ${entry.reason}` : ''}`, this.id);
+      kept += 1;
+      // ALPS: decide whether the candidate's metric transfers to the new
+      // HEAD. Single-keep + non-stale + clean apply is the safe-fresh
+      // case; everything else flips metricKnown=false until a
+      // baseline_repeat re-establishes it.
+      const validated = (events.events || []).find((e) => e.name === 'validated');
+      const candidateMetric = validated?.canonical_success && typeof validated[metricKey] === 'number'
+        && Number.isFinite(validated[metricKey])
+        ? validated[metricKey] : null;
+      if (isMultiKeepBlock || isStale || candidateMetric == null) {
+        const reason = isMultiKeepBlock ? 'multi_keep_block'
+          : isStale ? 'stale_baseline_warn_policy'
+          : 'candidate_metric_unknown';
+        if (isStale && policy === 'warn') {
+          log(`MANUAL_STALE_KEEP_APPLIED exp=${taskId} base=${candidateBaseCommit.slice(0, 7)} prev_head=${previousHeadCommit?.slice(0, 7) || 'null'} new_head=${result.commit.slice(0, 7)} — HEAD metric is now UNKNOWN until a baseline_repeat lands`, this.id);
+        }
+        this._setHeadState({
+          commit: result.commit,
+          metricKnown: false,
+          metric: null,
+          sourceExperiment: null,
+        });
+        log(`[head-state] KEEP advanced HEAD but metricKnown=false (${reason})`, this.id);
       } else {
-        log(`KEEP_EXPERIMENT ${taskId}: source/ advanced to ${result.commit.slice(0, 7)}${entry.reason ? ` — ${entry.reason}` : ''}`, this.id);
-        kept += 1;
+        // Safe-fresh manual KEEP: the candidate ran on previousHeadCommit
+        // with this exact edit set; we just re-applied the same edits
+        // to the same starting state. Metric transfers.
+        this._setHeadState({
+          commit: result.commit,
+          metricKnown: true,
+          metric: candidateMetric,
+          sourceExperiment: taskId,
+        });
       }
     }
     return kept;
@@ -2225,10 +2597,35 @@ class ProjectRunner {
     return ready;
   }
 
+  /**
+   * ALPS Phase 4: apply the quota-diversity filter to a parsed task-graph
+   * plan in place. Drops same-axis overflow per the configured quotas
+   * when `quotaDiversityEnabled` is true; otherwise no-op.
+   *
+   * @private
+   */
+  _applyQuotaDiversity(taskGraph) {
+    if (!this._isTaskGraphPlan(taskGraph) || !Array.isArray(taskGraph._tasks)) return;
+    const directConfig = this.loadConfig().directExecutor || null;
+    if (!directConfig?.quotaDiversityEnabled) return;
+    const result = applyDiversityQuota(taskGraph._tasks, {
+      quotaDiversityEnabled: true,
+      maxPerOperatorPerWake: directConfig.maxPerOperatorPerWake ?? 4,
+      maxSameOperatorValuePerWake: directConfig.maxSameOperatorValuePerWake ?? 1,
+      alwaysAllowValidation: directConfig.alwaysAllowValidation !== false,
+    });
+    if (result.dropped.length > 0) {
+      const ids = result.dropped.map((d) => `${d.task.id}(${d.reason})`).slice(0, 8).join(', ');
+      log(`[quota] dropped ${result.dropped.length} task(s): ${ids}${result.dropped.length > 8 ? ', …' : ''}`, this.id);
+    }
+    taskGraph._tasks = result.accepted;
+  }
+
   _mergeTaskGraphIntoCurrentPlan(plan, incoming) {
     if (!this._isTaskGraphPlan(plan) || !this._isTaskGraphPlan(incoming)) {
       return { added: 0, skipped: 0, skippedRunningDeps: 0, extendedBarriers: 0 };
     }
+    this._applyQuotaDiversity(incoming);
     this._ensureTaskGraphRuntime(plan);
     this._ensureTaskGraphRuntime(incoming);
     const existingIds = new Set(plan._tasks.map((task) => task.id));
@@ -2442,6 +2839,10 @@ class ProjectRunner {
       if (mismatch) {
         log(`Truth mismatch on ${taskId}: LLM claimed ${llmClaim ? 'success' : 'failure'}, canonical says ${verdict.success ? 'success' : 'failure'} (${verdict.reason || 'ok'})`, this.id);
       }
+      // ALPS Phase 2A: dry-run commit-gate decision. We log what the gate
+      // would do for every successful validation; Phase 2B flips the
+      // autoKeepEnabled flag to actually apply.
+      this._logCommitGateDecision(taskId, verdict);
     } catch (e) {
       // Validation must never break the orchestrator.
       try { log(`Canonical validation crashed for ${taskId}: ${e.message}`, this.id); } catch {}
@@ -3019,6 +3420,23 @@ class ProjectRunner {
         const taskFirstLine = typeof task.task === 'string'
           ? task.task.split(/\r?\n/)[0].trim().slice(0, 240)
           : null;
+        // ALPS Phase 0: capture the resolved baseline commit + the metric
+        // we believed it had at pick time. The operator posterior and the
+        // commit gate later consume these without consulting current HEAD
+        // (which may have advanced between pick and validate).
+        const directConfig = config?.directExecutor || null;
+        if (directConfig?.enabled) {
+          this._ensureHeadStateInitialized(directConfig);
+        }
+        let pickedBaseCommit = null;
+        if (directConfig?.sourceRepoPath && task.baseRef) {
+          try {
+            pickedBaseCommit = resolveCommitSha(directConfig.sourceRepoPath, task.baseRef);
+          } catch {
+            pickedBaseCommit = null;
+          }
+        }
+        const pickedBaseMetricAtPickTime = this._lookupBaseMetricAtPickTime(pickedBaseCommit);
         appendTaskEvent(this.taskEventsDir, task.id, 'picked', {
           attempt: plan._runtime.taskStates[task.id].attempts,
           worker: assignedWorker?.name || null,
@@ -3037,6 +3455,13 @@ class ProjectRunner {
           // them up by task id and re-apply them to source/. Only
           // populated for param_patch tasks (others have null).
           edits: Array.isArray(task.edits) ? task.edits : null,
+          // ALPS bookkeeping. picked_base_commit pins the SHA the sandbox
+          // was cloned from; picked_base_metric_at_pick_time + .source
+          // pins the metric we believed that baseline had at this moment
+          // (head_at_pick / lineage_entry / unknown).
+          picked_base_commit: pickedBaseCommit,
+          picked_base_metric_at_pick_time: pickedBaseMetricAtPickTime.metric,
+          picked_base_metric_source: pickedBaseMetricAtPickTime.source,
         });
 
         const launched = await this._startScheduledWorker(task, workers, config, managerName, orchestration, {
@@ -3324,6 +3749,7 @@ class ProjectRunner {
         }
         schedule = this.parseSchedule(result.resultText);
         if (schedule) {
+          this._applyQuotaDiversity(schedule);
           log(`Schedule: ${JSON.stringify(schedule)}`, this.id);
         }
         const completeMatch = result.resultText.match(/<!-- PROJECT_COMPLETE -->\s*([\s\S]*?)\s*<!-- \/PROJECT_COMPLETE -->/);

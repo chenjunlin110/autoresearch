@@ -166,7 +166,11 @@ class WeightedBucketSampler:
                 raise FileNotFoundError(
                     f"bucket {b!r} {split} split is empty at {data_root}/{b}/{split}.jsonl. "
                     f"Run prepare.py first.")
-        self.rng = np.random.default_rng(seed=42)
+        # Seed override for ALPS noise calibration; baseline_repeat tasks
+        # vary QWEN_SFT_SEED so run-to-run variance over val metric is
+        # measurable. Defaults to 42 (historical fixed seed).
+        _seed = int(os.environ.get("QWEN_SFT_SEED", "42"))
+        self.rng = np.random.default_rng(seed=_seed)
 
     def _tokenize_one(self, bucket, idx):
         cached = self._cache[bucket][idx]
