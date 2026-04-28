@@ -2191,20 +2191,27 @@ class ProjectRunner {
       // nothing to KEEP; skip.
       if (picked?.execution_mode !== 'param_patch') {
         if (picked?.execution_mode === 'baseline_repeat') {
-          // baseline_repeat establishes HEAD metric (when on HEAD); pick
-          // it up here so subsequent picks see metricKnown=true.
+          // ALPS HEAD-metric policy: pool *all* baseline_repeats on the
+          // current HEAD commit (priority=9 calibrations + manager-emitted
+          // ones) and use their MEAN as HEAD metric. With σ̂≈2.6e-3 in
+          // autoresearch's 300s budget, first-to-land would push HEAD
+          // metric anywhere within ±2σ of the true mean — every gate
+          // decision then anchors on that noisy point. Pooling shrinks
+          // the anchor's standard error to σ̂/√n.
           if (
             candidateBaseCommit
             && this.currentHeadCommit
             && candidateBaseCommit === this.currentHeadCommit
-            && !this.currentHeadMetricKnown
           ) {
-            this._setHeadState({
-              commit: this.currentHeadCommit,
-              metricKnown: true,
-              metric: yCandidate,
-              sourceExperiment: taskId,
-            });
+            const pooledMean = this._poolBaselineRepeatsOnHead(metricKey);
+            if (pooledMean != null) {
+              this._setHeadState({
+                commit: this.currentHeadCommit,
+                metricKnown: true,
+                metric: pooledMean.mean,
+                sourceExperiment: pooledMean.sourceExperimentLabel,
+              });
+            }
           }
         }
         return;
@@ -2320,6 +2327,51 @@ class ProjectRunner {
       `> **⚠ HEAD metric is currently unknown** — commit=${sha} has not been measured by a baseline_repeat or fresh-safe auto-KEEP yet.`,
       '> The commit gate is **DISABLED** until a `baseline_repeat` task lands on HEAD. Issue one (`execution_mode: "baseline_repeat", base_ref: "HEAD"`) or wait for the runtime to auto-enqueue one.',
     ].join('\n');
+  }
+
+  /**
+   * ALPS calibration pooling: scan all task-events for completed
+   * baseline_repeat experiments whose `picked_base_commit` matches
+   * current HEAD, and return the mean of their canonical metric. Each
+   * sample's standard error is σ̂/√n, so pooling is the cheapest way
+   * to shrink the HEAD-metric anchor's uncertainty without changing
+   * the gate's decision math.
+   *
+   * Returns null if no successful baseline_repeats on HEAD have landed.
+   *
+   * @private
+   * @param {string} metricKey
+   * @return {{mean: number, n: number, sourceExperimentLabel: string}|null}
+   */
+  _poolBaselineRepeatsOnHead(metricKey) {
+    if (!this.currentHeadCommit || !this.taskEventsDir) return null;
+    let entries = [];
+    try { entries = fs.readdirSync(this.taskEventsDir); } catch { return null; }
+    const samples = [];
+    const ids = [];
+    for (const name of entries) {
+      if (!name.endsWith('.json') || name.endsWith('.tmp')) continue;
+      try {
+        const raw = fs.readFileSync(path.join(this.taskEventsDir, name), 'utf-8');
+        const doc = JSON.parse(raw);
+        const events = doc?.events || [];
+        const picked = events.find((e) => e.name === 'picked');
+        const validated = events.find((e) => e.name === 'validated');
+        if (!picked || picked.execution_mode !== 'baseline_repeat') continue;
+        if (picked.picked_base_commit !== this.currentHeadCommit) continue;
+        if (!validated || validated.canonical_success !== true) continue;
+        const m = validated[metricKey];
+        if (typeof m !== 'number' || !Number.isFinite(m)) continue;
+        samples.push(m);
+        ids.push(doc.task_id);
+      } catch { /* tolerant */ }
+    }
+    if (samples.length === 0) return null;
+    const mean = samples.reduce((s, x) => s + x, 0) / samples.length;
+    const label = samples.length === 1
+      ? ids[0]
+      : `pooled(${samples.length}: ${ids.slice(0, 3).join(',')}${ids.length > 3 ? ',…' : ''})`;
+    return { mean, n: samples.length, sourceExperimentLabel: label };
   }
 
   _lookupBaseMetricAtPickTime(baseCommit) {
