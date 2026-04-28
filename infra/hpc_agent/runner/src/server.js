@@ -2936,7 +2936,7 @@ class ProjectRunner {
   }
 
   async _startScheduledWorker(step, workers, config, managerName, orchestration, options = {}) {
-    if (step?.executionMode === 'param_patch') {
+    if (step?.executionMode === 'param_patch' || step?.executionMode === 'baseline_repeat') {
       return this._startDirectExecutorTask(step, config, managerName, options);
     }
     const workerSelection = options.worker
@@ -3036,7 +3036,7 @@ class ProjectRunner {
   async _startDirectExecutorTask(step, config, managerName, options = {}) {
     const directConfig = (config?.directExecutor) || this.loadConfig().directExecutor || null;
     if (!directConfig?.enabled) {
-      log(`Cannot run param_patch task ${step.id}: directExecutor not configured`, this.id);
+      log(`Cannot run ${step.executionMode} task ${step.id}: directExecutor not configured`, this.id);
       return {
         started: false,
         blocked: true,
@@ -3097,6 +3097,16 @@ class ProjectRunner {
         if (step.earlyStop) {
           env.AUTORESEARCH_EARLY_STOP_AFTER_S = String(step.earlyStop.checkAtSeconds);
           env.AUTORESEARCH_EARLY_STOP_LOSS_ABOVE = String(step.earlyStop.abortIfLossAbove);
+        }
+        // ALPS baseline_repeat: vary the PRNG seed per task so each
+        // calibration run is genuinely different. Without this the
+        // sample variance is zero and the noise estimator has nothing
+        // to work with. Deterministic mapping from task id keeps
+        // re-runs of the same id reproducible.
+        if (step.executionMode === 'baseline_repeat' && env.AUTORESEARCH_SEED == null) {
+          let h = 5381;
+          for (let i = 0; i < step.id.length; i += 1) h = ((h << 5) + h + step.id.charCodeAt(i)) | 0;
+          env.AUTORESEARCH_SEED = String((h >>> 0) % 100000);
         }
 
         result = await runDirectTask({

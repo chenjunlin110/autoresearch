@@ -139,9 +139,11 @@ export function prepareDirectSandbox({
   if (!sourceRepoPath || !sandboxParentDir || !branchName || !parentRef) {
     return { ok: false, reason: 'missing required argument' };
   }
-  if (!Array.isArray(edits) || edits.length === 0) {
-    return { ok: false, reason: 'no edits provided' };
-  }
+  // ALPS baseline_repeat: edits=[] (or null) is legal — we clone the
+  // ref unchanged and let the wrapper run the harness. Skip the
+  // edits-required check; the apply/parse/commit steps below short-
+  // circuit cleanly on an empty edit list.
+  const isNoEdit = !Array.isArray(edits) || edits.length === 0;
   const baseCommit = resolveCommitSha(sourceRepoPath, parentRef);
   if (!baseCommit) {
     return { ok: false, reason: `cannot resolve parent ref "${parentRef}" in ${sourceRepoPath}` };
@@ -170,18 +172,20 @@ export function prepareDirectSandbox({
     return { ok: false, reason: `git setup failed: ${e.message}`, baseCommit };
   }
 
-  const editResult = applyEdits(sandboxDir, edits);
-  if (!editResult.ok) {
-    cleanup();
-    return {
-      ok: false,
-      reason: `edits failed: ${editResult.reason}`,
-      baseCommit,
-    };
+  if (!isNoEdit) {
+    const editResult = applyEdits(sandboxDir, edits);
+    if (!editResult.ok) {
+      cleanup();
+      return {
+        ok: false,
+        reason: `edits failed: ${editResult.reason}`,
+        baseCommit,
+      };
+    }
   }
 
   const filesToParse = parsePythonFiles
-    || [...new Set(edits.map((edit) => edit.file).filter((f) => typeof f === 'string' && f.endsWith('.py')))];
+    || (isNoEdit ? [] : [...new Set(edits.map((edit) => edit.file).filter((f) => typeof f === 'string' && f.endsWith('.py')))]);
   for (const relativePath of filesToParse) {
     const target = path.resolve(sandboxDir, relativePath);
     try {
@@ -200,27 +204,31 @@ export function prepareDirectSandbox({
     }
   }
 
-  let finalCommit;
-  try {
-    gitSilent(['add', '-A'], sandboxDir);
-    const status = gitText(['status', '--porcelain'], sandboxDir);
-    if (!status) {
+  let finalCommit = baseCommit;
+  if (!isNoEdit) {
+    try {
+      gitSilent(['add', '-A'], sandboxDir);
+      const status = gitText(['status', '--porcelain'], sandboxDir);
+      if (!status) {
+        cleanup();
+        return {
+          ok: false,
+          reason: 'edits produced no diff against parent (likely matched current contents)',
+          baseCommit,
+        };
+      }
+      gitSilent([
+        'commit', '-q', '-m', commitMessage || `direct-executor: ${branchName}`,
+      ], sandboxDir);
+      finalCommit = gitText(['rev-parse', 'HEAD'], sandboxDir);
+    } catch (e) {
       cleanup();
-      return {
-        ok: false,
-        reason: 'edits produced no diff against parent (likely matched current contents)',
-        baseCommit,
-      };
+      return { ok: false, reason: `git commit failed: ${e.message}`, baseCommit };
     }
-    gitSilent([
-      'commit', '-q', '-m', commitMessage || `direct-executor: ${branchName}`,
-    ], sandboxDir);
-    finalCommit = gitText(['rev-parse', 'HEAD'], sandboxDir);
-  } catch (e) {
-    cleanup();
-    return { ok: false, reason: `git commit failed: ${e.message}`, baseCommit };
   }
-
+  // For no-edit baseline_repeat the sandbox is exactly the parent
+  // commit; finalCommit == baseCommit is correct and downstream
+  // metadata (lineage, picked event) handles them as the same SHA.
   return { ok: true, sandboxDir, baseCommit, finalCommit };
 }
 
