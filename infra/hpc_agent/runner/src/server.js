@@ -3141,6 +3141,15 @@ class ProjectRunner {
               }
             : {}),
         });
+        // ALPS Phase 2A/2B: gate-decision hook for direct-executor
+        // experiments. The other validated-emission path (the
+        // worker-LLM path in _recordCanonicalValidation) hits its own
+        // call; without this hook, all param_patch / baseline_repeat
+        // runs through the direct executor would skip the gate.
+        this._logCommitGateDecision(taskId, {
+          success: !!result.ok,
+          metrics: result.metrics || null,
+        });
         return {
           success: !!result.ok,
           total: 1,
