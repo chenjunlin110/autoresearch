@@ -257,11 +257,23 @@ export function runDirectWorker({
   const logFd = fs.openSync(logPath, 'a');
 
   return new Promise((resolve) => {
+    // CRITICAL: tell the wrapper to run training from THIS experiment's
+    // sandbox, not the shared source/ dir. Without this the wrapper
+    // defaults to `$script_dir/source` and ignores cwd entirely, so
+    // every concurrent experiment fights over the same source/train.py
+    // and the per-experiment edits applied above are never seen by
+    // python. We pass a generic env name (DIRECT_EXECUTOR_REPO_ROOT)
+    // that all task wrappers respect as highest-priority repo_root.
+    const childEnv = {
+      ...process.env,
+      ...env,
+      DIRECT_EXECUTOR_REPO_ROOT: sandboxDir,
+    };
     const child = spawn('bash', [wrapperScript, outputDir, ...wrapperArgs], {
       cwd: sandboxDir,
       detached: true,
       stdio: ['ignore', logFd, logFd],
-      env: { ...process.env, ...env },
+      env: childEnv,
     });
     child.unref();
 

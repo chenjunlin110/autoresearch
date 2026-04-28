@@ -5,7 +5,14 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # script_dir = <repo>/tasks/autoresearch ; workspace_root = <repo>
 workspace_root="$(cd "$script_dir/../.." && pwd)"
 default_repo_root="$script_dir/source"
-repo_root="${AUTORESEARCH_REPO_ROOT:-$default_repo_root}"
+# DIRECT_EXECUTOR_REPO_ROOT (set by infra/hpc_agent/runner/src/direct-executor.js)
+# wins over AUTORESEARCH_REPO_ROOT and the default. This is what makes
+# `param_patch` experiments actually run from their per-experiment sandbox
+# instead of the shared source/ dir — without it, every concurrent worker
+# reads the same source/train.py and applied edits are invisible to python.
+repo_root="${DIRECT_EXECUTOR_REPO_ROOT:-${AUTORESEARCH_REPO_ROOT:-$default_repo_root}}"
+# Venv stays at the canonical source/.venv even when training from a sandbox —
+# every sandbox is a clone of source/, so the venv hasn't moved.
 venv_root="${AUTORESEARCH_VENV_ROOT:-$default_repo_root}"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"

@@ -5,7 +5,10 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # script_dir = <repo>/tasks/qwen-sft ; workspace_root = <repo>
 workspace_root="$(cd "$script_dir/../.." && pwd)"
 default_repo_root="$script_dir/source"
-repo_root="${QWEN_SFT_REPO_ROOT:-$default_repo_root}"
+# DIRECT_EXECUTOR_REPO_ROOT wins so per-experiment sandboxes actually get
+# picked up by python; otherwise concurrent experiments race over the same
+# source/train.py and edits applied to the sandbox are never read.
+repo_root="${DIRECT_EXECUTOR_REPO_ROOT:-${QWEN_SFT_REPO_ROOT:-$default_repo_root}}"
 venv_root="${QWEN_SFT_VENV_ROOT:-$default_repo_root}"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
