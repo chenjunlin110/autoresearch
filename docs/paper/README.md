@@ -75,16 +75,30 @@ package-agnostic.
   - Manual ALPS: job 1581726, post-fix, 65 evals, best 0.9920, one
     KEEP at $t \approx 55$ min.
   - Explicit ALPS: TBD, in progress.
-- **Pilot Qwen-SFT** (Table 2): Manual ALPS row populated from job
-  1584077 (8-GPU × 4 h, claude_cli runtime, EVAL_EVERY_STEPS=20).
-  32 evaluations completed at the snapshot used for the table; best
-  val_loss = 1.10875 (mix `chat=0.125, code=0.165, if=0.150,
-  math=0.280, reasoning=0.280`), $\Delta = -0.00094$ vs uniform
-  baseline (1.10968), zero KEEP directives fired. Noise floor
-  $\hat\sigma = 4 \times 10^{-5}$ from a paired baseline-repeat.
-  Reproducibility: two earlier co-leaders each replicated within
-  $6 \times 10^{-5}$ of original. Naive-parallel, serial, and
-  Explicit-ALPS rows still TBD (separate runs needed).
+- **Pilot Qwen-SFT** (Table 2): Table redesigned as a single
+  capability panel for Manual ALPS rather than a 4-policy comparison
+  (naive-parallel and serial Qwen-SFT runs require separate
+  allocations and are not yet collected). Numbers are from job
+  1584077 (8-GPU × 4 h, claude_cli runtime, EVAL_EVERY_STEPS=20)
+  at the end of the wall budget:
+  - 62 evaluations completed, 0 failures
+  - Best val_loss = 1.10859, mix `(chat, code, if, math, reasoning)
+    = (0.135, 0.170, 0.115, 0.295, 0.285)` — `exp_0058`
+  - $\Delta$ vs uniform baseline (1.10968) = $-1.09 \times 10^{-3}$
+  - $\hat\sigma$ from single paired baseline-repeat: $4 \times 10^{-5}$
+  - $\hat\sigma$ from 4-replicate same-mix family: $8 \times 10^{-5}$
+    (2× wider — single-pair underestimates)
+  - Improvement / $\hat\sigma_{n=4}$ ≈ 14 (conservative); ≈ 27 with
+    the single-pair estimate
+  - Top-6 evaluations within $1.1 \times 10^{-4}$ — search reached a
+    plateau and refined in place
+  - 5 mix shapes replicated by the manager itself (one $n=4$ family,
+    four $n=2$ pairs)
+  - 22 manager calls (0.35/eval); 5 maya analyst reports;
+    13 live replans + 5 barrier replans
+  - 0 KEEP directives fired despite >10$\hat\sigma$ signal —
+    confirming manager-conservatism predicted by autoresearch pilot
+  Naive-parallel, serial, and Explicit-ALPS comparisons still TBD.
 - **Ablation table** (Table 3): only "Manual ALPS full" and "−lineage"
   rows populated; the rest are dedicated 1-h runs that swap the
   manager's role in each ALPS decision for explicit code.
