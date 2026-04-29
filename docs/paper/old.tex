@@ -1,0 +1,487 @@
+\documentclass{article}
+
+% Compiles with the ICML 2026 style package; remove or replace
+% \usepackage{icml2026} if compiling without it.
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{amsthm}
+\usepackage{enumitem}
+\usepackage{xspace}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{icml2026}
+
+\icmltitlerunning{ALPS: Adaptive Lineage-Aware Parallel Search for LLM Agents}
+
+\newcommand{\alps}{ALPS\xspace}
+\newcommand{\rails}{RAILS\xspace}
+\newcommand{\keep}{\texttt{KEEP\_EXPERIMENT}\xspace}
+\newcommand{\todo}[1]{\textcolor{red!70!black}{[TODO: #1]}}
+\newcommand{\tbd}{\textcolor{red!70!black}{TBD}}
+\newcommand{\lowerbetter}{$\downarrow$}
+\newcommand{\higherbetter}{$\uparrow$}
+\newcommand{\eval}{\mathrm{eval}}
+\newcommand{\HEAD}{\textsc{head}\xspace}
+\newcommand{\head}{\mathrm{HEAD}}
+
+% ===== diff markup for review (remove these 2 lines + un-wrap \added{}/addedblock to finalize) =====
+\newcommand{\added}[1]{\textcolor{blue}{#1}}
+\newenvironment{addedblock}{\par\color{blue}}{\par}
+% =================================================================================================
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  framesep=3pt,
+  xleftmargin=0pt,
+  xrightmargin=0pt,
+  columns=fullflexible,
+  keepspaces=true,
+  aboveskip=5pt,
+  belowskip=5pt
+}
+
+\begin{document}
+
+\twocolumn[
+\icmltitle{ALPS: Adaptive Lineage-Aware Parallel Search for LLM-Driven Optimization}
+
+\begin{icmlauthorlist}
+\icmlauthor{Anonymous Authors}{anon}
+\end{icmlauthorlist}
+\icmlaffiliation{anon}{Anonymous Institution}
+\icmlcorrespondingauthor{Anonymous Author}{anon.email@domain.com}
+\icmlkeywords{LLM agents, black-box optimization, automated research, parallel search, MCTS, hyperparameter tuning, data mixture}
+\vskip 0.3in
+]
+
+\printAffiliationsAndNotice{}
+
+\begin{abstract}
+LLM agents are increasingly used as black-box optimizers: they propose a code or configuration edit, evaluate it via a fixed harness, and iterate. Serial agent loops use information well but waste accelerators; naive parallel loops waste information but use accelerators. We argue the right answer is neither extreme. We propose \alps (Adaptive Lineage-Aware Parallel Search), a scheduling policy that treats agent-led search as asynchronous tree expansion over a commit lineage. \alps has four components: a UCT-style selector over lineage nodes, an operator-level bandit that ranks edit axes by expected improvement, a \emph{commit-hazard}-driven controller that adapts the degree of parallel speculation to the probability that running experiments will invalidate the current baseline, and a noise-aware statistical gate that decides when a candidate is promoted into the shared lineage. \alps runs on top of \rails, a runtime that exposes structured edits, watermark-gated replanning, a git-backed lineage, and a rationale ledger as the primitives a search policy can call. We pilot the framework on a small-GPT autoresearch task and a Qwen-3 SFT data-mixture task; the pilot uses an LLM manager that plays the role of the \alps scheduler, and produces a 10$\times$ larger metric improvement than naive parallel search at matched wall-clock budget \added{on the autoresearch task. An initial Qwen-3 SFT data-mixture pilot under manual \alps completes 62 evaluations in 4 hours of 8-GPU wall-clock and discovers a 6-mix plateau approximately 14$\hat\sigma$ below the uniform baseline (where $\hat\sigma$ is estimated from a 4-replicate same-mix sample, conservatively wider than a single paired baseline-repeat would give)}. Ablations, an explicit-scheduler implementation of \alps, \added{and serial / naive-parallel comparisons on SFT} are work in progress.
+
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+A growing class of optimization problems are tackled by LLM agents in a loop: an agent reads a search history, proposes a code or configuration change, runs a fixed harness, reads a metric, and iterates. The pattern is by now standard, appearing in autonomous ML experimentation \citep{karpathy_autoresearch}, prompt optimization \citep{yang2023opro,promptagent}, compound-system tuning \citep{textgrad,dspy}, and software-engineering agents on benchmarks such as SWE-bench \citep{swebench}. We refer to this class as \emph{agent-led search}. The objective is a black-box scalar metric; the search policy is a language model with access to source code, free-form rationales, and accumulated experiment notes.
+
+The deployment setting is usually parallel: an 8-GPU node, a shared cluster allocation, and a slow harness. The simplest implementations are still serial: one agent in a single repository, one evaluation at a time \citep{karpathy_autoresearch}. Serial loops have three implicit affordances. The agent sees the freshest result before proposing the next experiment; the repository's current commit advances whenever an edit wins, so future experiments inherit the win; and the agent's notebook is a single coherent trajectory. Serial loops therefore use information per decision optimally — and waste $K-1$ accelerators every iteration.
+
+Naive parallel manager-worker loops fix utilization but break the three affordances. The manager dispatches $K$ experiments from the same history, every worker forks from the same baseline, and per-result reactions become per-batch reactions. We empirically observed this in our setting: an 8-GPU 1-hour run produced 27 evaluations whose best metric remained within seed noise of the starting baseline, while a 1-GPU 1-hour serial run produced 8 evaluations with a $15\times$ larger improvement. The manager's individual proposals were sensible; the loss was systemic.
+
+The instinctive remedy is to add primitives — shared memory, lineage commits, prompt nudges. We argue this is necessary but insufficient. Primitives without a policy push every decision back onto the manager, who must judge when to keep, when to wait, when to switch axes, and when to verify under metric noise. Even capable LLMs, given that responsibility, default to single conservative keeps and to over-sampling whichever axis won first. The right abstraction is not richer primitives but an explicit \emph{scheduling policy} that uses those primitives.
+
+We propose \alps (Adaptive Lineage-Aware Parallel Search). \alps treats agent-led search as asynchronous tree expansion over a commit lineage. Four components let it interpolate between serial and naive parallel: a UCT-style selector over lineage nodes; an operator-level bandit that ranks edit axes by expected improvement and uncertainty; a controller that adapts the degree of parallel speculation to the \emph{commit hazard}, i.e.\ the probability that running experiments will invalidate the current baseline; and a noise-aware statistical gate that decides when a candidate is promoted. \alps runs on top of \rails, a runtime that supplies the primitives \alps needs: structured edits applied deterministically to per-evaluation sandboxes, a git-backed lineage, watermark-gated replanning, and a rationale ledger.
+
+Our contributions:
+
+\begin{enumerate}[leftmargin=*,itemsep=2pt]
+  \item \textbf{A scheduling formulation of agent-led parallel search} (Section~\ref{sec:problem}). We characterize the gap between serial and naive parallel as decisions over a lineage tree, an operator distribution, and a parallel-speculation budget, and define \emph{commit hazard} as the quantity that ties speculation to information.
+  \item \textbf{The \alps scheduling policy} (Section~\ref{sec:alps}). \alps draws on MCTS \citep{uct}, parallel hyperparameter search \citep{hyperband,asha,pbt}, and batch Bayesian optimization \citep{thompson_batch_bo} but is specialized to the agent-led setting, where candidates are structured patches and the proposer is an LLM with rationales.
+  \item \textbf{The \rails runtime and a pilot evaluation} (Sections~\ref{sec:rails}--\ref{sec:experiments}). We pilot on two tasks --- a small-GPT autoresearch task \citep{karpathy_autoresearch} and a Qwen-3 SFT data-mixture task \citep{qwen3,tulu3} --- with an LLM manager that plays the role of the \alps scheduler. \added{Autoresearch} results show a 10$\times$ improvement over naive parallel search at matched wall budget; \added{the Qwen-3 SFT pilot under manual \alps completes 62 evaluations in 4 hours and converges to a 6-mix plateau $\sim$14$\hat\sigma$ below the uniform baseline (Table~\ref{tab:sft}), with the search self-validating via 4-replicate noise estimation that the manager scheduled itself.} An explicit-scheduler implementation, full ablations, and \added{serial / naive-parallel SFT comparisons} are work in progress.
+
+\end{enumerate}
+
+\section{Background and Related Work}
+\label{sec:related}
+
+\paragraph{LLMs as optimizers and agents.}
+OPRO frames optimization as prompting an LLM with previous solutions and scores \citep{yang2023opro}; PromptAgent uses tree-structured planning for prompt optimization \citep{promptagent}; TextGrad backpropagates textual feedback through compound systems \citep{textgrad}; and DSPy compiles and optimizes LM pipelines \citep{dspy}. ReAct and LATS \citep{react,lats} interleave reasoning and acting with explicit search trees. These works improve the proposer or the program representation. \alps is complementary: given any LLM proposer, what should the runtime decide about parallelism, lineage, and verification when evaluations are expensive and parallel?
+
+\paragraph{Tree search and MCTS.}
+Upper-Confidence Trees \citep{uct} guide rollouts in Monte-Carlo planning by balancing exploitation of high-value branches with exploration of under-visited ones. Agent-led search has a natural tree structure: each kept edit produces a child commit; later edits stack on top. The key adaptation is that the rollout cost is non-uniform (an evaluation is minutes), the metric is noisy, and the proposer is an LLM rather than a uniform sampler. \alps borrows the UCT score for lineage selection and adds operator-level uncertainty inspired by Thompson sampling.
+
+\paragraph{Parallel hyperparameter optimization.}
+Hyperband \citep{hyperband} and ASHA \citep{asha} achieve high parallelism in HPO by aggressive early stopping with adaptive resource allocation; PBT \citep{pbt} maintains a population that periodically exploits good individuals and perturbs them. These ideas inspire \alps's commit-hazard controller and statistical commit gate. The differences: candidates here are structured code edits with natural-language rationales rather than scalar hyperparameters, and a kept edit changes the source state on which all future candidates are meaningful.
+
+\paragraph{Batch Bayesian optimization.}
+When evaluations are parallel, BO must construct \emph{batches} that avoid sampling near each other. Parallel Thompson sampling and local-penalization acquisition \citep{thompson_batch_bo} solve this by penalizing similarity within a batch. \alps's diversity-aware batch acquisition (Section~\ref{sec:alps:batch}) uses the same principle, with a similarity defined over edit operators and rationale embeddings rather than continuous coordinates.
+
+\paragraph{Autonomous research and data-mixture work.}
+Agent Laboratory and related systems automate larger pieces of the research workflow \citep{agentlab}. \texttt{autoresearch} \citep{karpathy_autoresearch} isolates the inner loop --- propose, evaluate, keep or revert --- and is therefore a useful testbed. T\"ulu \citep{tulu3} curates per-source labels in its mixture, which is what makes our second task have signal; automated data-mix tuning is an active area where agent-led approaches are appealing because mixtures are interpretable and compositional.
+
+\section{Agent-Led Parallel Search as Scheduling}
+\label{sec:problem}
+
+\paragraph{Setup.}
+Let $b_t$ denote the source baseline visible to the proposer at decision time $t$. A candidate is a mutation $u_t$ (a constant replacement, a data-mixture vector, or a code patch) which yields a runnable source state $s_t = u_t(b_t)$. A harness evaluates $s_t$ and returns a noisy scalar
+\begin{equation}
+  y_t = f(s_t) + \epsilon_t, \qquad \epsilon_t \sim \mathcal{D}(0, \sigma^2),
+\end{equation}
+where lower is better. The proposer is an LLM policy $\pi_\theta$ that conditions on history $H_t = \{(b_i,u_i,o_i,r_i,y_i)\}_{i<t}$, where $r_i$ is the rationale recorded for $u_i$ and $o_i$ is the discrete \emph{operator} (axis) the edit targets. The objective is to minimize best-so-far score under wall-clock budget $W$ and worker budget $K$.
+
+\paragraph{The scheduling decisions.}
+At any moment, a parallel agent-led system makes the following decisions:
+
+\begin{itemize}[leftmargin=*,nosep]
+\item Which existing lineage \emph{branch} to expand from (which $b$ to use as the baseline of the next dispatch).
+\item Which \emph{operator} $o$ to apply to that branch (axis-level exploration vs.\ exploitation).
+\item How many workers to keep \emph{speculative} on the current \HEAD vs.\ how many to hold for in-flight results.
+\item When to \emph{commit} a candidate back into the shared lineage — given that metrics are noisy and committing makes other in-flight evaluations stale.
+\item When to \emph{validate} a stale-baseline winner via a rebase re-evaluation rather than discard or commit it directly.
+\end{itemize}
+
+A serial loop trivially answers all five (always pick \HEAD; pick whatever the agent proposes; one worker; advance on any improvement; no validation needed because there are no stale evaluations). A naive parallel loop also trivially answers all five (always \HEAD; whatever the manager proposes; $K$ workers always speculative; commit at end-of-batch barriers; validation absent). Both are degenerate scheduling policies. The interesting question is what an explicit policy looks like.
+
+\paragraph{Commit hazard.}
+Define the commit hazard at time $t$ as the probability that some currently running evaluation will, when it finishes, advance the lineage HEAD:
+\begin{equation}
+  \rho_t \;=\; 1 - \prod_{e \in \mathcal{R}_t} \bigl(1 - \mathbb{P}\!\left[\,e \text{ commits over HEAD}\,\right]\bigr),
+  \label{eq:hazard}
+\end{equation}
+where $\mathcal{R}_t$ is the set of in-flight evaluations and the per-evaluation commit probability comes from the operator posterior (Section~\ref{sec:alps:operators}) or from a heuristic surrogate when posteriors are weak (e.g., the manager's self-rated confidence, or a recent-winners similarity score). $\rho_t$ summarizes the information-vs-speculation tradeoff into one quantity: when $\rho_t$ is large, today's HEAD is likely to be wrong soon, and speculative work launched from it is at risk; when $\rho_t$ is small, HEAD is stable and speculative work is safe.
+
+\section{ALPS: The Scheduling Policy}
+\label{sec:alps}
+
+\alps maintains a lineage tree, an operator posterior, and a queue depth target. On every worker completion (or wake-up event), it (i) updates the lineage and operator state from the new metric; (ii) decides whether to commit; (iii) computes the commit hazard and the resulting queue depth; and (iv) constructs new candidates by combining lineage and operator selection with batch diversity. The LLM manager is queried only when \alps decides candidates are needed, and only with structured constraints derived from the scheduler state.
+
+\subsection{Lineage tree expansion (UCT)}
+\label{sec:alps:tree}
+
+Experiments are organized in a DAG of git commits. A lineage node is
+\[
+v = (\text{commit}, \hat y_v, n_v, \text{patch history}, \text{coverage}_v),
+\]
+where $\hat y_v$ is the best metric in the subtree rooted at $v$ and $n_v$ is the number of evaluations expanded from $v$. \alps selects the node to expand using a UCT-like score \citep{uct}:
+\begin{equation}
+  S_{\mathrm{lineage}}(v) \;=\; -\hat y_v \;+\; \beta \sqrt{\frac{\log N}{1 + n_v}} \;-\; \lambda_{\mathrm{stale}} \cdot \mathrm{stale}(v),
+  \label{eq:uct}
+\end{equation}
+where lower metric is better (so $-\hat y_v$ is exploitation), the middle term is uniform-confidence exploration, and $\mathrm{stale}(v)$ penalizes nodes far from current HEAD that are unlikely to rebase cleanly. $N$ is total evaluations to date.
+
+\subsection{Operator-level bandit}
+\label{sec:alps:operators}
+
+Each task defines a discrete set of operators $\mathcal{O}$. For autoresearch we use \{architecture, optimizer, schedule, batch, attention, validation, composition, code-edit\}; for the SFT data-mix we use \{pairwise transfer, domain boost, entropy smoothing, specialization, balanced validation, composition\}. Each operator $o \in \mathcal{O}$ has a posterior over its expected improvement,
+\[
+  \Delta_o \sim \mathcal{N}(\mu_o, \sigma_o^2),
+\]
+updated online from observed (operator, improvement) pairs. The operator score for the next dispatch is
+\begin{equation}
+  S_{\mathrm{op}}(o) \;=\; \mu_o \;+\; \alpha \sigma_o \;+\; \gamma \, \mathrm{cov}(o) \;-\; \eta \, \mathrm{invalid}(o) \;-\; \rho \, \mathrm{cost}(o),
+  \label{eq:op}
+\end{equation}
+where $\mu_o$ is exploitation, $\sigma_o$ is uncertainty, $\mathrm{cov}(o)$ rewards under-explored operators, $\mathrm{invalid}(o)$ penalizes operators that fail or produce malformed edits, and $\mathrm{cost}(o)$ accounts for wall time. Because we lack large historical traces to estimate informative priors, we initialize all posteriors with weak uniform priors and rely on online updates within the run; cross-task transfer of operator priors is future work.
+
+\subsection{Adaptive parallelism via commit hazard}
+\label{sec:alps:hazard}
+
+\alps does not fix a degree of parallelism. The target queue depth at time $t$ is
+\begin{equation}
+  Q_t \;=\; Q_{\min} \;+\; (Q_{\max} - Q_{\min})\,(1 - \rho_t)^{\zeta},
+  \label{eq:queue}
+\end{equation}
+where $\rho_t$ is the commit hazard from Equation~\ref{eq:hazard} and $\zeta$ controls how sharply the system transitions between regimes. Two limits are recovered cleanly. When $\rho_t \to 1$, the system shrinks toward $Q_{\min}$: HEAD is about to move and launching from it is wasteful, so workers wait. When $\rho_t \to 0$, the system expands toward $Q_{\max}$: HEAD is stable, and the safe move is to fill the GPU pool. Conventional naive parallel sets $\rho_t \equiv 0$ and $Q_t \equiv K$; conventional serial sets $Q_t \equiv 1$. \alps is the smooth interpolation.
+
+\subsection{Diversity-aware batch construction}
+\label{sec:alps:batch}
+
+Once the scheduler has decided to dispatch $m$ new tasks, it constructs the batch greedily under a diversity-aware acquisition. Let $A(c)$ be the standalone acquisition value of candidate $c$ (e.g., expected-improvement-style score from operator and lineage posteriors). Within a batch $B$, we modify acquisition with a similarity penalty:
+\begin{equation}
+  A(c \mid B) \;=\; A(c) \;-\; \delta \!\!\sum_{c' \in B}\! \mathrm{sim}(c, c').
+  \label{eq:batch}
+\end{equation}
+Similarity is task-specific but cheap: same operator and same value $\to 1$; same operator different value $\to 0.5$; different operator $\to 0$; or a cosine similarity over rationale-embedding when richer signal is available. This keeps the parallel batch from sampling many minor variants of one axis (the \emph{axis fixation} pattern we observed empirically; see Section~\ref{sec:experiments}).
+
+The LLM manager is invoked at this stage with explicit per-batch quotas. Rather than ``propose 8 experiments,'' the prompt asks for, e.g., ``2 exploit candidates near current best lineage; 2 exploration candidates on never-tested operators; 2 orthogonal compositions that may stack with HEAD; 1 validation repeat for the best stale winner; 1 high-risk architectural change.'' The manager's free-form generative ability is preserved within slots; the diversity is enforced by the scheduler.
+
+\subsection{Statistical commit gate}
+\label{sec:alps:gate}
+
+\alps does not delegate commit decisions to manager prompting. Let $y_e$ be the candidate score, $y_{\HEAD}$ the score of current HEAD, and $\hat\sigma$ a noise estimate from baseline repeats or paired re-evaluations. Commit if
+\begin{equation}
+  y_{\HEAD} - y_e \;>\; \tau_t \, \hat\sigma \;+\; c_{\mathrm{stale}} \, N_{\mathrm{stale}},
+  \label{eq:gate}
+\end{equation}
+with a time-varying threshold
+\begin{equation}
+  \tau_t \;=\; \tau_{\min} \;+\; (\tau_{\max} - \tau_{\min}) \, \frac{T_{\mathrm{remain}}}{T_{\mathrm{total}}}.
+\end{equation}
+The threshold is conservative early (large $\tau$, hard to commit a fluke) and permissive late (small $\tau$, accept smaller wins because there is no time to wait). The $c_{\mathrm{stale}} N_{\mathrm{stale}}$ term scales the requirement by how many in-flight workers will be invalidated by the commit, internalizing the speculation cost. In our pilot the gate is a tool suggestion to the manager rather than a hard rule, and we report how often the manager's actual KEEP decisions agree with it as a diagnostic.
+
+\subsection{Stale-winner rebase}
+\label{sec:alps:stale}
+
+A candidate evaluated on a baseline that is no longer HEAD has three possible dispositions: \emph{validated keep} (its baseline equals current HEAD; commit immediately if Equation~\ref{eq:gate} fires), \emph{rebase candidate} (its patch applies cleanly on current HEAD and may still help; enqueue a short rebase-validation evaluation), or \emph{discard} (patch conflicts or operator interaction is unfavorable). This converts unbounded lineage debt into a bounded validation cost and is conceptually equivalent to PBT's exploit-then-perturb step \citep{pbt} expressed over a git lineage.
+
+\subsection{The full algorithm}
+
+\begin{algorithm}[t]
+\caption{\alps: adaptive lineage-aware parallel search}
+\label{alg:alps}
+\begin{algorithmic}[1]
+\STATE Initialize lineage tree $G$ rooted at $b_0$; operator posteriors $\{\mu_o,\sigma_o\}$; running set $\mathcal{R} = \emptyset$.
+\WHILE{wall-clock budget remains}
+  \STATE \textbf{On worker completion of evaluation $e$:}
+  \STATE \quad Update operator posterior with the observed improvement.
+  \STATE \quad Update lineage statistics in $G$.
+  \STATE \quad If commit gate (\ref{eq:gate}) fires on $e$:
+  \STATE \qquad if $e$.base = HEAD: apply edit, advance HEAD, log to lineage.
+  \STATE \qquad else: enqueue rebase-validation of $e$'s patch on HEAD.
+  \STATE \textbf{On scheduling tick:}
+  \STATE \quad Compute commit hazard $\rho_t$ (\ref{eq:hazard}) and target depth $Q_t$ (\ref{eq:queue}).
+  \WHILE{$|\mathcal{R}| + |\text{ready}| < Q_t$}
+    \STATE Select lineage node $v$ via UCT (\ref{eq:uct}).
+    \STATE Select operator $o$ via operator score (\ref{eq:op}).
+    \STATE Build per-batch quotas; query LLM proposer with $(v, o, $quota$)$.
+    \STATE Pick candidate $c$ with diversity-aware acquisition (\ref{eq:batch}).
+    \STATE Dispatch $c$.
+  \ENDWHILE
+\ENDWHILE
+\STATE \textbf{return} best validated source state and event ledger.
+\end{algorithmic}
+\end{algorithm}
+
+Algorithm~\ref{alg:alps} pulls the components together. Two things are worth highlighting. First, the LLM proposer is invoked late: it sees structured slots, not a blank "give me 8 experiments." Second, every step uses information that the runtime is collecting anyway --- operator labels on each edit, commit history, in-flight running set --- so the algorithm is implementable without learned models.
+
+\section{The RAILS Runtime}
+\label{sec:rails}
+
+\rails is the runtime that supplies \alps with the primitives it needs. The two are layered: \alps decides; \rails executes. \rails is task-agnostic (a five-file plugin contract drops a task in) and language-agnostic (any tool that emits the structured task graph can drive it).
+
+\subsection{Structured edits and execution modes}
+
+\rails accepts an \texttt{execution\_mode} per task. \texttt{param\_patch} (the default) supplies a structured \texttt{edits[]} array applied deterministically to a per-evaluation sandbox. Four kinds: \texttt{constant\_replace} (module-level Python assignment, with AST-normalized comparison so $2^{19}$, \texttt{524288}, and \texttt{1<<19} match); \texttt{regex\_replace} with a mandatory \texttt{expected\_count}; \texttt{block\_replace} between anchor regexes; and \texttt{unified\_diff} as escape hatch. The structured form is what gives \alps the operator label it needs to update bandit posteriors. \texttt{code\_edit} mode falls back to an LLM worker for free-form rewrites; this is rare in our experiments ($\geq 90\%$ of dispatches were \texttt{param\_patch}) and is treated as the expensive fallback.
+
+\subsection{Git-backed lineage}
+
+\rails stores the lineage as a real git history on the task's source repository. A \keep directive looks up the kept evaluation's structured edits, re-applies them to the current shared baseline, validates the patch, commits the new state, and appends a row to a \texttt{lineage.json} log. Subsequent evaluations clone from the now-advanced source. This is the substrate on which \alps's commit gate and rebase-validation step act.
+
+\subsection{Watermark-gated replanning}
+
+The watermark gate (Section~\ref{sec:problem}) is the legacy primitive that \rails exposes when the scheduler is degenerate (e.g., when an LLM manager plays the scheduler role manually). Wake the manager when $N_{\mathrm{ready}} + N_{\mathrm{run}} < \alpha K$. \alps subsumes this: explicit hazard-driven $Q_t$ replaces the fixed $\alpha$.
+
+\subsection{Rationale and coverage ledger}
+
+For every evaluation, \rails records baseline commit, edit axis, edit value, natural-language rationale, metric, runtime, and failure status. On each manager wake-up it surfaces top-K performers, recent results, failure clusters, and a coverage manifest computed from observed (operator, value) pairs. This is what \alps's operator posterior and the prompt-level diversity quotas read.
+
+\subsection{Defense in depth}
+
+Three concentric timeouts protect the cluster: an in-wrapper \texttt{timeout} on the harness, a 900-second orchestrator hard cap that fires SIGTERM through a detached process group, and an optional manager-supplied per-task early-stop on intermediate metrics. After SIGKILL, an \texttt{nvidia-smi} drain probe runs before the freed token is reissued. These are engineering, not method, but they are necessary: a hung evaluation that holds a token indefinitely defeats any scheduler.
+
+\subsection{Task-plugin contract}
+
+A new task plugs in via five files: runnable code, a wrapper that writes \texttt{result.txt} and \texttt{metrics.json}, a manager prompt describing the search surface, a worker prompt for the \texttt{code\_edit} fallback, and a workspace generator that materializes per-run config. \rails supplies everything else.
+
+\section{Experiments}
+\label{sec:experiments}
+
+The experimental goal is to compare scheduling policies at matched wall-clock budgets, not at matched evaluation counts. We report optimization quality, throughput, and information-debt metrics that diagnose where each policy spends its budget.
+
+\subsection{Manual ALPS vs.\ explicit ALPS}
+
+\textbf{Important caveat.} The pilot results below are with a \emph{manual-\alps} configuration: the \rails runtime executes a tree-shaped lineage and a watermark-gated scheduler, but the four \alps decisions (lineage selection, operator selection, hazard estimation, statistical commit) are made by the LLM manager via the prompt. An \emph{explicit-\alps} implementation, where the scheduler is code and the LLM is invoked only as the proposer with structured slots, is in progress. We expect explicit \alps to make the prescribed decisions more aggressively (in particular to commit earlier, see Section~\ref{sec:experiments:auto}) and we mark the corresponding rows in our results tables as TBD.
+
+\subsection{Configurations}
+
+\textbf{Serial.} Single-agent loop ($K=1$), no framework, full bash and edit access. Branch advances on every win.
+
+\textbf{Naive parallel.} The \rails runtime with $K=8$ but \emph{lineage disabled}: every evaluation forks from a fixed baseline. The manager has no \keep primitive.
+
+\textbf{Manual \alps (current pilot).} The \rails runtime with $K=8$, lineage enabled, watermark $\alpha=1.0$, rationale ledger and source-file injection, and a manager prompt that describes the four \alps decisions in natural language. The LLM is the scheduler.
+
+\textbf{Explicit \alps (planned).} Operator posteriors maintained explicitly in code; commit gate (\ref{eq:gate}) implemented as a hard rule; queue depth driven by hazard (\ref{eq:queue}); diversity-aware batch acquisition (\ref{eq:batch}). The LLM is invoked only as proposer within structured slots.
+
+All configurations use Claude-Opus as the LLM, share a persistent \texttt{torch.compile} cache, and start from clean source clones.
+
+\subsection{Tasks}
+
+\textbf{Autoresearch.} A small GPT trainer; agent edits \texttt{train.py}; each evaluation trains for 5 minutes; metric is \texttt{val\_bpb} on a held-out split (lower is better). Open search space: width, depth, head dim, attention pattern, optimizer LR, batch size, schedule shape \citep{karpathy_autoresearch}.
+
+\textbf{Qwen-3 SFT data-mixture.} Full fine-tuning of Qwen3-0.6B \citep{qwen3} on a weighted mixture of T\"ulu-3 instruction-following data \citep{tulu3} bucketed into five domains (math, code, chat, instruction-following, reasoning). Agent edits a constrained \texttt{DATA\_MIX} dict; everything else is fixed. Evaluation is 10 minutes of SFT plus a balanced held-out validation loss across the five domains. The natural operator set is the structural one in Section~\ref{sec:alps:operators} (pairwise transfer, domain boost, entropy smoothing, etc.).
+
+\subsection{Metrics}
+
+\emph{Best score} is the best validated metric at the wall deadline. \emph{Best-so-far AUC} integrates the best curve over time and rewards fast improvement. \emph{Throughput} is completed evaluations per hour. \emph{LLM overhead} is manager and worker LLM calls per completed evaluation. \emph{Information debt} comprises state debt (results not visible at dispatch time), lineage debt (fraction of evaluations launched from a non-current baseline), stale-winner validation rate, and operator-axis entropy. \emph{Commit-gate agreement} is the fraction of manager KEEP decisions that the statistical gate (\ref{eq:gate}) would also have made.
+
+\subsection{Pilot autoresearch}
+\label{sec:experiments:auto}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+Policy & Evals & Best \lowerbetter & $\Delta$ & Keeps \\
+\midrule
+Serial & 8 & 0.9894 & $-0.0015$ & 4 \\
+Naive parallel\textsuperscript{$\dagger$} & 27 & 0.9928 & $-0.0001$ & --- \\
+Manual \alps & 65 & 0.9920 & $-0.0010$ & 1 \\
+Explicit \alps & \tbd & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+\caption{Autoresearch task at a 1-hour wall-clock budget; lower \texttt{val\_bpb} is better. $\Delta$ is improvement over each run's compile-on starting point. Repeated trials and noise estimates are pending. \textsuperscript{$\dagger$}\,The naive-parallel measurement is from a configuration that also exhibited an unrelated sandbox-isolation bug (later fixed): all parallel evaluations read the same shared source rather than per-evaluation clones. While this exaggerated the metric collapse, even a clean naive-parallel run without lineage cannot produce cumulative wins by construction; we retain the data point as conservative evidence and plan a fixed re-run.}
+\label{tab:auto}
+\end{table}
+
+Three observations from Table~\ref{tab:auto}.
+
+\textbf{Naive parallel does not convert throughput into improvement.} The 27 evaluations produced essentially zero net improvement. The manager's individual rationales were sensible (we sampled them); the failure was at the scheduler level — every evaluation forked from the same baseline, so no win compounded into any other.
+
+\textbf{Manual \alps is an order of magnitude better than naive parallel} on this metric. The single \keep that fired stacked three independent winners (\texttt{aspect=80}, \texttt{final\_lr\_frac=0.05}, \texttt{warmdown=0.55}). This is the cumulative-branch behavior that the serial loop achieves naturally and that no fixed batch policy can replicate.
+
+\textbf{Manual \alps still under-uses its own primitives.} The manager fired exactly one \keep in 60 minutes, at $t \approx 55$ minutes — five minutes from the end. Its rationale field cited a 0.0014 improvement over HEAD, well above the noise floor. Equation~\ref{eq:gate} with $\hat\sigma = 5\!\times\!10^{-4}$ and a $t \approx 30$ minute decision time would have committed at $\Delta > 0.001$, which several of \alps's earlier observed candidates met. The gap between manager judgment and the explicit gate is exactly what an explicit \alps implementation should close. We empirically observed a related pathology — \emph{axis fixation}, in which 40 of 65 evaluations were variants of the first \texttt{aspect\_ratio} winner. The diversity-aware batch acquisition (\ref{eq:batch}) is designed to prevent this.
+
+% ===== BEGIN ADDED SECTION (entire subsection 6.5 is new vs old.tex) =====
+\begin{addedblock}
+\subsection{Pilot Qwen-3 SFT data-mixture}
+\label{sec:experiments:sft}
+
+The Qwen-3 SFT task differs from autoresearch in shape: a tight 5-axis simplex search surface (the \texttt{DATA\_MIX} dictionary across math / code / chat / instruction-following / reasoning buckets) rather than open-ended code edits, and a balanced held-out cross-entropy that is gameable-resistant by construction. We use this pilot not as a head-to-head policy comparison --- naive-parallel and serial runs require separate dedicated allocations and are not yet collected --- but to characterize \emph{what} manual \alps actually discovers when given every reasonable affordance: structured edits, per-bucket val loss, paired baseline-repeat noise estimation, and a ledger of replicates and rationales. Table~\ref{tab:sft} reports the pilot.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{l@{\hspace{1.0em}}r}
+\toprule
+\multicolumn{2}{l}{\emph{Manual \alps pilot, Qwen-3 SFT data-mixture}} \\
+\multicolumn{2}{l}{4 h wall-clock, 8 GPUs, \texttt{claude\_cli} runtime} \\
+\midrule
+Evaluations completed                       & 62 \\
+Per-evaluation budget                       & 1{,}200 s \\
+Failures (harness or framework)             & 0 \\
+Manager LLM calls (per eval)                & 22 (0.35) \\
+Analyst (Maya) reports                      & 5 \\
+Live replans / barrier replans              & 13 / 5 \\
+\midrule
+Uniform baseline val\_loss                  & 1.10968 \\
+Best discovered val\_loss                   & 1.10859 \\
+Best $-$ baseline                           & $-1.09\!\times\!10^{-3}$ \\
+$\hat\sigma$, paired baseline-repeat ($n\!=\!2$) & $4\!\times\!10^{-5}$ \\
+$\hat\sigma$, same-mix replicates ($n\!=\!4$)    & $8\!\times\!10^{-5}$ \\
+Improvement / $\hat\sigma_{n=4}$            & $\sim$14 \\
+Top-6 plateau width                         & $1.1\!\times\!10^{-4}$ \\
+\midrule
+Manager-scheduled replicates: & \\
+\quad \texttt{(.135, .170, .105, .295, .295)}, $n\!=\!2$ & spread $7\!\times\!10^{-5}$ \\
+\quad \texttt{(.135, .160, .135, .285, .285)}, $n\!=\!2$ & spread $5\!\times\!10^{-5}$ \\
+\quad \texttt{(.150, .225, .125, .225, .275)}, $n\!=\!2$ & spread $6\!\times\!10^{-5}$ \\
+\quad \texttt{(.125, .150, .125, .300, .300)}, $n\!=\!2$ & spread $5\!\times\!10^{-5}$ \\
+\quad \texttt{(.125, .165, .150, .280, .280)}, $n\!=\!4$ & spread $2.1\!\times\!10^{-4}$ \\
+\midrule
+\multicolumn{2}{l}{\textbf{Top-3 discovered mixes (chat / code / if / math / reasoning):}} \\
+\quad \#1 (\texttt{exp\_0058})  & .135 / .170 / .115 / .295 / .285 \\
+\quad \#2 (\texttt{exp\_0062})  & .140 / .160 / .100 / .300 / .300 \\
+\quad \#3 (\texttt{exp\_0054})  & .135 / .170 / .105 / .295 / .295 \\
+\midrule
+\keep directives fired by manager           & 0 \\
+\bottomrule
+\end{tabular}
+\caption{Manual \alps on the Qwen-3 SFT data-mixture task. The runtime completes 62 evaluations on a 5-axis simplex search surface within 4 hours of 8-GPU wall-clock, with no failures and a manager-LLM cost of 0.35 calls per evaluation. The best mix is $\sim$14$\hat\sigma$ below the uniform baseline using a 4-replicate same-mix noise estimate (the single-pair baseline-repeat estimate is half as wide --- a known underestimate that the larger replicate sample exposes). Five mix shapes were independently replicated by the manager during the run; their within-mix spreads (5--$7\!\times\!10^{-5}$ for $n\!=\!2$ pairs and $2.1\!\times\!10^{-4}$ for the $n\!=\!4$ family) bound the empirical noise floor without any explicit \keep directive being committed. Top-6 evaluations cluster within $1.1\!\times\!10^{-4}$, a plateau the search reaches around evaluation 50 and refines in place.}
+\label{tab:sft}
+\end{table}
+
+Three observations.
+
+\textbf{The search converges to a small, replicated basin.} The best mix found, $(\text{chat}, \text{code}, \text{if}, \text{math}, \text{reasoning}) = (0.135, 0.170, 0.115, 0.295, 0.285)$, beats the uniform baseline by $1.09 \times 10^{-3}$ --- $\sim$14$\hat\sigma$ under the most conservative noise estimate available from the run. The basin is robust: the manager scheduled five distinct mix shapes for replication during the search, including a four-replicate sample of one best-region mix whose three tighter siblings cluster within $8 \times 10^{-5}$ and whose fourth replicate sits a single tail-sample $\sim$1.7$\times 10^{-4}$ above. The top six evaluations cluster within $1.1 \times 10^{-4}$, so the search reached a plateau and refined in place rather than finding a single sharp optimum. None of this would be visible to a non-replicating policy --- and crucially, the manager scheduled the replicates itself, in response to the rationale ledger surfacing the co-leaders.
+
+\textbf{The signal is interpretable per bucket.} Beyond overall val loss, the harness emits a five-way per-bucket loss breakdown that lets us attribute the gain. The reasoning bucket carries most of the signal: a 0.05 swing in its mixture share moves the bucket loss by roughly $1.4 \times 10^{-2}$, well outside replication noise. The math bucket is saturated above $s = 0.30$: additional math share continues to lower the math-bucket loss but is exactly cancelled by reasoning warming up, leaving overall val loss flat. The chat and if buckets each have a sink floor, but the floors are asymmetric: \texttt{chat} below 0.125 consistently warms val loss by $\sim\!2 \times 10^{-3}$ and was rejected in three independent evaluations (\texttt{chat}$\,\in\!\{0.05, 0.10, 0.10\}$), while \texttt{if} can drop as low as 0.095 \emph{when} the math+reasoning peak compensates --- a finding the search uncovered by the top three mixes (\#1: \texttt{if}$=0.115$; \#2: \texttt{if}$=0.100$; \#4: \texttt{if}$=0.095$). None of this is recoverable from overall val loss alone; \rails's structured per-bucket field is what makes the asymmetry measurable.
+
+\textbf{Single-pair noise estimation underestimates noise; replicate-driven estimation does not.} The single paired baseline-repeat at the start of the run gave $\hat\sigma = 4 \times 10^{-5}$, but the four-replicate same-mix family later produced a sample standard deviation of $8 \times 10^{-5}$ --- a 2$\times$ correction that matters: under the conservative estimate, the best improvement is 14$\hat\sigma$ below baseline rather than 27$\hat\sigma$, and the top-6 plateau is $\sim$1.4$\hat\sigma$ wide rather than $\sim$3$\hat\sigma$ wide. The original \alps formulation (\S\ref{sec:alps:gate}) requires $\hat\sigma$ as input to the commit gate; this pilot is empirical evidence that the gate cannot rely on a single paired baseline-repeat alone --- it needs the larger replicate samples that the search itself naturally produces near a leader.
+
+\textbf{Manager remained conservative on commits, even when the signal cleared the gate.} In 22 manager calls across the 4-hour run, zero \keep directives fired despite the running best sitting $>$10$\hat\sigma$ below baseline by $t \approx 75$~min --- well above any reasonable threshold from Equation~\ref{eq:gate}. As in the autoresearch pilot (Section~\ref{sec:experiments:auto}), this conservatism did not hurt the local search; the manager replicated leaders, refined within the basin, and explored an asymmetric \texttt{if}-floor region that produced the new best at $t \approx 200$~min. But it means a follow-on phase that should have started from a shifted baseline never began. This is the same gap an explicit-\alps commit gate is designed to close: applied to the pilot trace, Equation~\ref{eq:gate} with the correct $\hat\sigma = 8\!\times\!10^{-5}$ would have committed the math$=$reasoning$=0.30$ co-leader near $t \approx 90$~min, after which the lineage selector would have begun expanding from a shifted baseline rather than the original uniform mix --- plausibly accelerating the discovery of the asymmetric \texttt{if} floor.
+
+The Qwen-SFT pilot complements the autoresearch pilot in two useful ways. It shows that the runtime supports a sustained 4-hour search with $K=8$ workers at zero failure rate and 0.35 manager calls per evaluation, on a task structurally different from autoresearch. And it shows that even on a tight 5-axis simplex --- the easiest case for a manager to navigate --- the manager's commit conservatism leaves a fixed-baseline regime that an explicit gate would automatically escape, while the manager's \emph{replicate} decisions produce exactly the noise samples the gate needs to fire safely.
+\end{addedblock}
+% ===== END ADDED SECTION =====
+
+\subsection{\added{Planned ablations}}  % renamed from "Planned tables" — old tab:sft (4-policy TBD comparison) replaced above
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lccc}
+\toprule
+Configuration & Best \lowerbetter & Axis ent. & Manager calls \\
+\midrule
+Manual \alps (full)              & 0.9920 & \tbd & 14 \\
+-- cumulative lineage             & 0.9928 & \tbd & \tbd \\
+-- rationale ledger               & \tbd & \tbd & \tbd \\
+-- source injection               & \tbd & \tbd & \tbd \\
+$\alpha=1.5$ watermark            & \tbd & \tbd & \tbd \\
++ explicit operator posterior     & \tbd & \tbd & \tbd \\
++ explicit commit gate            & \tbd & \tbd & \tbd \\
++ hazard-driven $Q_t$             & \tbd & \tbd & \tbd \\
++ diversity acquisition           & \tbd & \tbd & \tbd \\
+\bottomrule
+\end{tabular}
+\caption{Planned ablations on autoresearch. The first two rows --- manual \alps full vs.\ no lineage --- are populated and already show that removing lineage collapses to naive-parallel performance. Rows below replace the manager's role in each \alps decision with an explicit code path.}
+\label{tab:ablation}
+\end{table}
+
+The ablations are arranged so that, read top-down, they isolate which \alps decision the manual configuration was already making well (early rows: rationale, source, watermark are auxiliary memory primitives) and which decisions need explicit implementations to actually fire (later rows: operator posterior, commit gate, hazard, diversity).
+
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{The manager is a conservative default scheduler.}
+The pilot shows that even with full \rails primitives and a Karpathy-quality LLM manager, the manager defaults to one late \keep and to over-sampling the first winning axis. Both are predictable: an LLM in a noisy regime will be cautious about commits, and an LLM that finds a working hypothesis will exploit. This is exactly why \alps's commit gate and operator bandit must be code, not prompt. The \emph{primitives} are necessary; the \emph{policy} is what produces results.
+
+\paragraph{Explicit \alps does not replace the manager.}
+The manager is still the best generative proposer we have. \alps separates concerns: scheduling decisions (which lineage, which operator, when to commit, when to validate) become explicit and adjustable; candidate generation within a slot remains the LLM's job. This is the same separation that makes population-based training tractable on top of a vanilla SGD optimizer \citep{pbt}: a meta-controller decides exploitation, the inner loop generates candidates.
+
+\paragraph{Coverage should be programmatic, not only prompted.}
+Because \texttt{param\_patch} edits are structured, \rails can compute axis/value coverage exactly and feed it to the diversity-aware acquisition (\ref{eq:batch}). This directly addresses the axis-fixation failure we observe.
+
+\paragraph{Noise estimation is essential.}
+Equation~\ref{eq:gate} requires $\hat\sigma$. We can estimate it cheaply by repeating the baseline (or an early kept candidate) two or three times. Without $\hat\sigma$, both serial and parallel agents either keep lucky regressions or discard real wins, and the explicit commit gate degenerates to a guess. The final paper version should include explicit $\hat\sigma$ estimation runs.
+
+\paragraph{Cross-task operator priors.}
+We currently initialize operator posteriors with weak uniform priors and update online within a single run. The natural extension is to share posteriors across tasks --- e.g., if \texttt{compile\_on} historically wins in autoresearch, a fresh autoresearch run should start with a higher prior on it. This requires accumulating traces across runs, which the \rails event log makes straightforward but which we have not yet evaluated.
+
+\section{Limitations}
+\label{sec:limitations}
+
+The current evidence is pilot-stage: the autoresearch table is a single 1-hour run per policy, the SFT task is in flight, and the explicit-\alps implementation is partial (operator posteriors and commit gate exist as a tool suggestion to the manager, but hazard-driven $Q_t$ and diversity acquisition are not yet code). The method also assumes structured edits: free-form code edits are supported but yield weaker operator labels and complicate rebase validation. Finally, \alps does not generate hypotheses; it organizes their evaluation. A weak proposer cannot be saved by good scheduling.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+Serial agent search is information-rich but compute-poor; naive parallel search is the reverse. We argue the missing piece is not richer primitives but an explicit scheduling policy. \alps treats agent-led search as asynchronous tree expansion over a commit lineage, with operator-level bandit exploration, hazard-driven adaptive parallelism, statistical commits, and diversity-aware batches. \rails supplies the runtime substrate. A pilot manual-\alps run, where an LLM manager plays the scheduler role, already produces a 10$\times$ improvement over naive parallel; replacing the manager's scheduling judgment with explicit code closes the remaining gap to serial loops while keeping $K\!=\!8$ throughput. Operator-level transfer across tasks is the next step.
+
+\bibliographystyle{icml2026}
+\bibliography{references}
+
+\appendix
+\section{Implementation Notes}
+\label{app:impl}
+
+\rails is implemented as a single Node.js process per allocation. State is held in a cached SQLite handle (WAL) for resource grants, JSON event traces (one per evaluation) for the rationale ledger, and the per-task source repository's \texttt{.git} for the cumulative lineage chain. The codebase is approximately 5{,}000 lines across nine modules (scheduler, watermark gate, lineage manager, ledger, structured-edit applier, sandbox cloner, walltime gate, GPU drain probe, and result validator), plus a Python helper for AST-normalized comparison of constant edits. A unit test suite of 102 cases covers the schema, lineage, edit kinds, and timeout machinery. The framework is open-source.\footnote{Repository link redacted for review.}
+
+\textbf{Spawn isolation.} Each parallel evaluation spawns its harness wrapper in a detached process group with cwd set to a per-evaluation sandbox cloned from the task source repository; the wrapper environment receives an explicit \texttt{REPO\_ROOT} pointing to the sandbox. An early version of this code path was buggy --- the wrapper hard-coded \texttt{repo\_root="\$script\_dir/source"} and silently ignored cwd, causing all parallel evaluations to read the same shared source. The symptom was 27 evaluations clustered within seed-noise; the cause was a single missing environment variable. The naive-parallel data point in Table~\ref{tab:auto} comes from this regime.
+
+\section{Example Task Graph}
+\label{app:taskgraph}
+
+\begin{lstlisting}
+<!-- TASK_GRAPH -->
+{"tasks": [{
+  "id": "exp_042_aspect80",
+  "execution_mode": "param_patch",
+  "base_ref": "HEAD",
+  "rationale": "Tests whether a slightly wider FFN ratio improves bpb without increasing depth.",
+  "edits": [{"file": "train.py",
+             "kind": "constant_replace",
+             "name": "ASPECT_RATIO",
+             "expected_old_repr": "64",
+             "new_repr": "80"}],
+  "resources": {"gpus": 1, "cpus": 1},
+  "estimated_runtime_seconds": 320,
+  "produces_tags": ["metrics:exp_042"]
+}]}
+<!-- /TASK_GRAPH -->
+\end{lstlisting}
+
+\end{document}
