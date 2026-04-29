@@ -385,7 +385,7 @@ function renderDirectExecutorBlock({
   envEntries.push(`    WANDB_ENTITY: ${process.env.WANDB_ENTITY || 'haolong'}`);
   envEntries.push(`    WANDB_RUN_GROUP: ${wandbGroup}`);
   envEntries.push(`    WANDB_TAGS: qwen-sft,datamix,framework`);
-  envEntries.push(`    EVAL_EVERY_STEPS: ${process.env.EVAL_EVERY_STEPS || '200'}`);
+  envEntries.push(`    EVAL_EVERY_STEPS: ${process.env.EVAL_EVERY_STEPS || '20'}`);
   // SFT_TIME_BUDGET_SECONDS must reach the worker via env — direct-executor.js
   // does not auto-translate config.timeBudgetSeconds. Without this the worker
   // would default to 600s regardless of --time-budget-seconds.
