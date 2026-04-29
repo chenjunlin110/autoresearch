@@ -1,17 +1,17 @@
 // Naive-parallel variant of the qwen-sft manager. Same RAILS runtime, same
-// K=8, same direct executor, same metric — but the manager's primitives are
-// stripped to match the paper's "Naive parallel" definition:
-//   - lineage disabled (no KEEP_EXPERIMENT primitive in the prompt)
-//   - no rationale-as-memory framing (manager isn't told the ledger replays
-//     past rationales next cycle)
-//   - no source-file injection (train.py text isn't embedded in the prompt)
-//   - no live replan; manager is only re-called when the graph drains
-//     (refillOnGraphDrain) so it must propose fresh batches in lockstep
+// K=8, same direct executor, same metric — what makes this "naive parallel":
+//   - manager is only re-called when the graph drains (no live replan)
+//   - all 4 ALPS scheduling-decision knobs OFF: no auto-keep gate, no
+//     calibration repeats, no diversity quota, no hazard-driven Q_t,
+//     no stale-rebase, no head-validation auto-enqueue
+//   - the manager retains the KEEP_EXPERIMENT primitive: at the end of each
+//     wave it may decide to advance HEAD to one of the completed mixes,
+//     just without any of ALPS's gate/hazard/diversity machinery helping
 //
 // All other infrastructure stays (param_patch + constant_replace, 5-bucket
-// search surface, val_loss metric, baseline_repeat noise estimation, kill
-// primitives, walltime gate). The point is to hold everything constant
-// except the four ALPS scheduling decisions surfaced via prompt.
+// search surface, val_loss metric, kill primitives, walltime gate). The
+// point is to hold the runtime + proposer constant and isolate the effect
+// of (a) live replan and (b) the 4 ALPS knobs.
 
 import { mkdirSync, writeFileSync } from 'fs';
 import path from 'path';
@@ -73,10 +73,14 @@ export function renderNaiveManagerProgram({
 
 You are the manager for a **naive-parallel** data-mix search over Tulu-3 SFT mixtures applied to Qwen3-0.6B full fine-tuning. The framework dispatches your tasks to a pool of GPU workers; you propose new \`DATA_MIX\` weights and read back \`val_loss\`.
 
-This is **not** a lineage-aware run. Specifically:
-- You have **no \`KEEP_EXPERIMENT\` primitive**. The repository HEAD never moves; every experiment forks from the original uniform-mix baseline.
-- You are called **once per batch** (after all ${experimentsPerWave} workers in the previous batch finish), not on individual completions.
-- You will not be shown a memory of past rationales. Treat each batch as if it is the next move in a parallel sweep — no cumulative reasoning across waves is required.
+How this run differs from the full ALPS configuration:
+- You are called **once per batch** (after all ${experimentsPerWave} workers in the previous batch finish). There is **no live replan**: the framework will not wake you on individual task completions.
+- The framework does **not** auto-fire any commit gate. There is no auto-keep, no diversity-quota enforcement, no hazard-driven queue depth, no automatic baseline-repeat calibration, no stale-rewinner rebase. The only ALPS scheduling primitive you have is your own \`KEEP_EXPERIMENT\` directive.
+
+What you can do at the end of each batch:
+- Read the latest batch's \`val_loss\` results.
+- Propose the next batch of ${experimentsPerWave} mixes.
+- Optionally emit \`<!-- KEEP_EXPERIMENT --><exp_id><!-- /KEEP_EXPERIMENT -->\` to advance HEAD to one of the completed mixes. After a KEEP, the next batch's experiments fork from the new HEAD (the kept mix), not the original uniform mix. You decide whether and when to KEEP based on the table you see.
 
 ## Goal
 
@@ -94,7 +98,7 @@ Each batch, output a single \`<!-- TASK_GRAPH -->\` block with **exactly ${exper
 
 - \`worker_class: "experiment_runner"\`
 - \`execution_mode: "param_patch"\`
-- \`base_ref: "HEAD"\` (always — HEAD does not move in this configuration)
+- \`base_ref: "HEAD"\` (HEAD only moves when **you** emit a KEEP between batches)
 - \`resources: {"gpus": 1, "cpus": 2}\`
 - Unique \`id\` like \`exp_b3_w0_math_heavy\` (\`b\` = batch number, \`w\` = within-batch index)
 - Unique \`produces_tags\` like \`["metrics:exp_b3_w0_math_heavy"]\`
@@ -114,7 +118,7 @@ Constraints:
 - All five keys must be present.
 - All values must be \`>= 0\`. Trainer normalizes to sum = 1 internally; decimal values in \`[0.0, 1.0]\` are easiest to read.
 - Don't add new keys.
-- Because HEAD is fixed, \`expected_old_repr\` is **always** \`"{'math': 0.20, 'code': 0.20, 'chat': 0.20, 'if': 0.20, 'reasoning': 0.20}"\`.
+- \`expected_old_repr\` must match the **current** HEAD's \`DATA_MIX\` value (uniform until you emit a KEEP, then whatever the kept mix was).
 
 ### Worked TASK_GRAPH (batch 1)
 
@@ -155,9 +159,13 @@ A failed \`param_patch\` writes \`${experimentName}/<id>/failure.json\`. Most co
 
 You will be called once per batch, after the previous ${experimentsPerWave} experiments all finish. Each call:
 
-1. Read the latest batch's \`val_loss\` results in your runtime context. Look at the table; do not assume any cross-wave memory.
-2. Decide the next batch of ${experimentsPerWave} mixes. Independent of past batches' detailed reasoning — propose what looks promising given the current observed table.
-3. Append a \`TASK_GRAPH\` with exactly ${experimentsPerWave} tasks. Do not repeat any task id from any prior batch.
+1. Read the latest batch's \`val_loss\` results plus any prior history in your runtime context.
+2. **Optionally emit a \`KEEP_EXPERIMENT\`** to advance HEAD if you see a clearly winning mix in the latest batch. Format:
+   \`\`\`
+   <!-- KEEP_EXPERIMENT -->exp_b2_w3_math_heavy<!-- /KEEP_EXPERIMENT -->
+   \`\`\`
+   This is the only ALPS primitive you have. Use it sparingly; the framework will not auto-fire it for you, and there is no statistical commit gate enforcing a minimum effect size — that's your judgment call.
+3. Append a \`TASK_GRAPH\` with exactly ${experimentsPerWave} new tasks for the next batch. Do not repeat any task id from any prior batch.
 
 Don't emit \`PROJECT_COMPLETE\`. Continue dispatching ${experimentsPerWave}-batch waves until the wall budget is exhausted.
 
