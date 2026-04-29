@@ -32,6 +32,11 @@
 \newcommand{\HEAD}{\textsc{head}\xspace}
 \newcommand{\head}{\mathrm{HEAD}}
 
+% ===== diff markup for review (remove these 2 lines + un-wrap \added{}/addedblock to finalize) =====
+\newcommand{\added}[1]{\textcolor{blue}{#1}}
+\newenvironment{addedblock}{\par\color{blue}}{\par}
+% =================================================================================================
+
 \lstset{
   basicstyle=\ttfamily\footnotesize,
   breaklines=true,
@@ -62,7 +67,7 @@
 \printAffiliationsAndNotice{}
 
 \begin{abstract}
-LLM agents are increasingly used as black-box optimizers: they propose a code or configuration edit, evaluate it via a fixed harness, and iterate. Serial agent loops use information well but waste accelerators; naive parallel loops waste information but use accelerators. We argue the right answer is neither extreme. We propose \alps (Adaptive Lineage-Aware Parallel Search), a scheduling policy that treats agent-led search as asynchronous tree expansion over a commit lineage. \alps has four components: a UCT-style selector over lineage nodes, an operator-level bandit that ranks edit axes by expected improvement, a \emph{commit-hazard}-driven controller that adapts the degree of parallel speculation to the probability that running experiments will invalidate the current baseline, and a noise-aware statistical gate that decides when a candidate is promoted into the shared lineage. \alps runs on top of \rails, a runtime that exposes structured edits, watermark-gated replanning, a git-backed lineage, and a rationale ledger as the primitives a search policy can call. We pilot the framework on a small-GPT autoresearch task and a Qwen-3 SFT data-mixture task; the pilot uses an LLM manager that plays the role of the \alps scheduler, and produces a 10$\times$ larger metric improvement than naive parallel search at matched wall-clock budget on the autoresearch task. An initial Qwen-3 SFT data-mixture pilot under manual \alps completes 62 evaluations in 4 hours of 8-GPU wall-clock and discovers a 6-mix plateau approximately 14$\hat\sigma$ below the uniform baseline (where $\hat\sigma$ is estimated from a 4-replicate same-mix sample, conservatively wider than a single paired baseline-repeat would give). Ablations, an explicit-scheduler implementation of \alps, and serial / naive-parallel comparisons on SFT are work in progress.
+LLM agents are increasingly used as black-box optimizers: they propose a code or configuration edit, evaluate it via a fixed harness, and iterate. Serial agent loops use information well but waste accelerators; naive parallel loops waste information but use accelerators. We argue the right answer is neither extreme. We propose \alps (Adaptive Lineage-Aware Parallel Search), a scheduling policy that treats agent-led search as asynchronous tree expansion over a commit lineage. \alps has four components: a UCT-style selector over lineage nodes, an operator-level bandit that ranks edit axes by expected improvement, a \emph{commit-hazard}-driven controller that adapts the degree of parallel speculation to the probability that running experiments will invalidate the current baseline, and a noise-aware statistical gate that decides when a candidate is promoted into the shared lineage. \alps runs on top of \rails, a runtime that exposes structured edits, watermark-gated replanning, a git-backed lineage, and a rationale ledger as the primitives a search policy can call. We pilot the framework on a small-GPT autoresearch task and a Qwen-3 SFT data-mixture task; the pilot uses an LLM manager that plays the role of the \alps scheduler, and produces a 10$\times$ larger metric improvement than naive parallel search at matched wall-clock budget \added{on the autoresearch task. An initial Qwen-3 SFT data-mixture pilot under manual \alps completes 62 evaluations in 4 hours of 8-GPU wall-clock and discovers a 6-mix plateau approximately 14$\hat\sigma$ below the uniform baseline (where $\hat\sigma$ is estimated from a 4-replicate same-mix sample, conservatively wider than a single paired baseline-repeat would give)}. Ablations, an explicit-scheduler implementation of \alps, \added{and serial / naive-parallel comparisons on SFT} are work in progress.
 \end{abstract}
 
 \section{Introduction}
@@ -83,7 +88,7 @@ Our contributions:
 \begin{enumerate}[leftmargin=*,itemsep=2pt]
   \item \textbf{A scheduling formulation of agent-led parallel search} (Section~\ref{sec:problem}). We characterize the gap between serial and naive parallel as decisions over a lineage tree, an operator distribution, and a parallel-speculation budget, and define \emph{commit hazard} as the quantity that ties speculation to information.
   \item \textbf{The \alps scheduling policy} (Section~\ref{sec:alps}). \alps draws on MCTS \citep{uct}, parallel hyperparameter search \citep{hyperband,asha,pbt}, and batch Bayesian optimization \citep{thompson_batch_bo} but is specialized to the agent-led setting, where candidates are structured patches and the proposer is an LLM with rationales.
-  \item \textbf{The \rails runtime and a pilot evaluation} (Sections~\ref{sec:rails}--\ref{sec:experiments}). We pilot on two tasks --- a small-GPT autoresearch task \citep{karpathy_autoresearch} and a Qwen-3 SFT data-mixture task \citep{qwen3,tulu3} --- with an LLM manager that plays the role of the \alps scheduler. Autoresearch results show a 10$\times$ improvement over naive parallel search at matched wall budget; the Qwen-3 SFT pilot under manual \alps completes 62 evaluations in 4 hours and converges to a 6-mix plateau $\sim$14$\hat\sigma$ below the uniform baseline (Table~\ref{tab:sft}), with the search self-validating via 4-replicate noise estimation that the manager scheduled itself. An explicit-scheduler implementation, full ablations, and serial / naive-parallel SFT comparisons are work in progress.
+  \item \textbf{The \rails runtime and a pilot evaluation} (Sections~\ref{sec:rails}--\ref{sec:experiments}). We pilot on two tasks --- a small-GPT autoresearch task \citep{karpathy_autoresearch} and a Qwen-3 SFT data-mixture task \citep{qwen3,tulu3} --- with an LLM manager that plays the role of the \alps scheduler. \added{Autoresearch} results show a 10$\times$ improvement over naive parallel search at matched wall budget; \added{the Qwen-3 SFT pilot under manual \alps completes 62 evaluations in 4 hours and converges to a 6-mix plateau $\sim$14$\hat\sigma$ below the uniform baseline (Table~\ref{tab:sft}), with the search self-validating via 4-replicate noise estimation that the manager scheduled itself.} An explicit-scheduler implementation, full ablations, and \added{serial / naive-parallel SFT comparisons} are work in progress.
 \end{enumerate}
 
 \section{Background and Related Work}
@@ -327,6 +332,8 @@ Three observations from Table~\ref{tab:auto}.
 
 \textbf{Manual \alps still under-uses its own primitives.} The manager fired exactly one \keep in 60 minutes, at $t \approx 55$ minutes — five minutes from the end. Its rationale field cited a 0.0014 improvement over HEAD, well above the noise floor. Equation~\ref{eq:gate} with $\hat\sigma = 5\!\times\!10^{-4}$ and a $t \approx 30$ minute decision time would have committed at $\Delta > 0.001$, which several of \alps's earlier observed candidates met. The gap between manager judgment and the explicit gate is exactly what an explicit \alps implementation should close. We empirically observed a related pathology — \emph{axis fixation}, in which 40 of 65 evaluations were variants of the first \texttt{aspect\_ratio} winner. The diversity-aware batch acquisition (\ref{eq:batch}) is designed to prevent this.
 
+% ===== BEGIN ADDED SECTION (entire subsection 6.5 is new vs old.tex) =====
+\begin{addedblock}
 \subsection{Pilot Qwen-3 SFT data-mixture}
 \label{sec:experiments:sft}
 
@@ -385,8 +392,10 @@ Three observations.
 \textbf{Manager remained conservative on commits, even when the signal cleared the gate.} In 22 manager calls across the 4-hour run, zero \keep directives fired despite the running best sitting $>$10$\hat\sigma$ below baseline by $t \approx 75$~min --- well above any reasonable threshold from Equation~\ref{eq:gate}. As in the autoresearch pilot (Section~\ref{sec:experiments:auto}), this conservatism did not hurt the local search; the manager replicated leaders, refined within the basin, and explored an asymmetric \texttt{if}-floor region that produced the new best at $t \approx 200$~min. But it means a follow-on phase that should have started from a shifted baseline never began. This is the same gap an explicit-\alps commit gate is designed to close: applied to the pilot trace, Equation~\ref{eq:gate} with the correct $\hat\sigma = 8\!\times\!10^{-5}$ would have committed the math$=$reasoning$=0.30$ co-leader near $t \approx 90$~min, after which the lineage selector would have begun expanding from a shifted baseline rather than the original uniform mix --- plausibly accelerating the discovery of the asymmetric \texttt{if} floor.
 
 The Qwen-SFT pilot complements the autoresearch pilot in two useful ways. It shows that the runtime supports a sustained 4-hour search with $K=8$ workers at zero failure rate and 0.35 manager calls per evaluation, on a task structurally different from autoresearch. And it shows that even on a tight 5-axis simplex --- the easiest case for a manager to navigate --- the manager's commit conservatism leaves a fixed-baseline regime that an explicit gate would automatically escape, while the manager's \emph{replicate} decisions produce exactly the noise samples the gate needs to fire safely.
+\end{addedblock}
+% ===== END ADDED SECTION =====
 
-\subsection{Planned ablations}
+\subsection{\added{Planned ablations}}  % renamed from "Planned tables" — old tab:sft (4-policy TBD comparison) was removed and replaced by tab:sft above
 
 \begin{table}[t]
 \centering
