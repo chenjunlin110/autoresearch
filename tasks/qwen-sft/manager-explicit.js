@@ -48,6 +48,7 @@ export function renderExplicitConfig({
   gpuCount = 8,
   agentRuntime = 'codex_cli',
   directExecutor = null,
+  liveReplanOnTaskComplete = true,
 } = {}) {
   const runtime = ['codex_cli', 'claude_cli', 'api'].includes(agentRuntime) ? agentRuntime : 'codex_cli';
   const count = Number(gpuCount) || 0;
@@ -83,18 +84,26 @@ function renderExplicitDirectExecutorBlock({
   sharedCacheRoot = null,
   timeBudgetSeconds = 1200,
   hardCapSeconds = 2100,
+  // ALPS knobs — parameterizable so we can sweep σ̂ / τ schedules.
+  calibrationRepeats = 3,
+  fallbackSigma = 0.0001,
+  gateTauMin = 0.1,
+  gateTauMax = 0.5,
+  variantTag = '',
 }) {
   const envEntries = [];
   if (resultsPath) envEntries.push(`    QWEN_SFT_RESULTS_PATH: ${resultsPath}`);
   if (sharedCacheRoot) envEntries.push(`    AUTORESEARCH_SHARED_CACHE_ROOT: ${sharedCacheRoot}`);
   const hfHome = path.join(process.env.HOME || '', '.cache', 'huggingface');
   if (process.env.HOME) envEntries.push(`    HF_HOME: ${hfHome}`);
+  const variantSuffix = variantTag ? `-${variantTag}` : '';
   const wandbGroup = process.env.QWEN_SFT_WANDB_GROUP
-    || `qwen-sft-explicit-${new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`;
+    || `qwen-sft-explicit${variantSuffix}-${new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}`;
+  const wandbTags = `qwen-sft,datamix,explicit-alps${variantTag ? ',variant-' + variantTag : ''}`;
   envEntries.push(`    WANDB_PROJECT: ${process.env.WANDB_PROJECT || 'workshop'}`);
   envEntries.push(`    WANDB_ENTITY: ${process.env.WANDB_ENTITY || 'haolong'}`);
   envEntries.push(`    WANDB_RUN_GROUP: ${wandbGroup}`);
-  envEntries.push(`    WANDB_TAGS: qwen-sft,datamix,explicit-alps`);
+  envEntries.push(`    WANDB_TAGS: ${wandbTags}`);
   envEntries.push(`    EVAL_EVERY_STEPS: ${process.env.EVAL_EVERY_STEPS || '20'}`);
   envEntries.push(`    SFT_TIME_BUDGET_SECONDS: ${timeBudgetSeconds}`);
   const envLines = envEntries.length
@@ -111,11 +120,11 @@ function renderExplicitDirectExecutorBlock({
   hardCapSeconds: ${hardCapSeconds}
   # ===== Explicit ALPS — all 4 scheduling decisions promoted to code =====
   # 1. Statistical commit gate (Eq. 6): auto-fire KEEP when Δ > τ_t · σ̂.
-  fallbackSigma: 0.0001          # > our n=4 estimate (8e-5) — gate cautious until calibration
-  calibrationRepeats: 3          # 3 baseline repeats to estimate σ̂ empirically
+  fallbackSigma: ${fallbackSigma}         # σ̂ prior used before calibrationRepeats finishes
+  calibrationRepeats: ${calibrationRepeats}          # baseline repeats to estimate σ̂ empirically
   autoKeepEnabled: true          # gate AUTO-fires KEEP_EXPERIMENT
-  gateTauMin: 0.1                # late-run threshold (most aggressive)
-  gateTauMax: 0.5                # early-run threshold (more conservative)
+  gateTauMin: ${gateTauMin}                # late-run threshold (most aggressive)
+  gateTauMax: ${gateTauMax}                # early-run threshold (more conservative)
   # 2. Stale-winner rebase (§4.6): auto re-evaluate stale candidates on HEAD.
   rebaseValidationEnabled: true
   manualStaleKeepPolicy: block   # forbid manual KEEP from a stale base
@@ -152,6 +161,12 @@ export function createExplicitWorkspace(options = {}) {
   const gpuCount = Number(options.gpuCount ?? 8);
   const experimentWorkerCount = Number(options.experimentWorkerCount ?? gpuCount ?? 8);
   const agentRuntime = options.agentRuntime || 'codex_cli';
+  // ALPS-knob sweep parameters; defaults match Variant A (current pilot).
+  const calibrationRepeats = Number(options.calibrationRepeats ?? 3);
+  const fallbackSigma = Number(options.fallbackSigma ?? 0.0001);
+  const gateTauMin = Number(options.gateTauMin ?? 0.1);
+  const gateTauMax = Number(options.gateTauMax ?? 0.5);
+  const variantTag = options.variantTag || '';
 
   mkdirSync(path.dirname(paths.readmePath), { recursive: true });
   mkdirSync(path.dirname(paths.experimentWorkerSkillPaths[0]), { recursive: true });
@@ -201,6 +216,11 @@ export function createExplicitWorkspace(options = {}) {
       sharedCacheRoot: toPosix(paths.sharedCacheRoot),
       timeBudgetSeconds,
       hardCapSeconds: timeBudgetSeconds + 900,
+      calibrationRepeats,
+      fallbackSigma,
+      gateTauMin,
+      gateTauMax,
+      variantTag,
     },
   }), 'utf8');
   writeFileSync(paths.projectsYamlPath, renderProjectsYaml({

@@ -49,8 +49,16 @@ fi
 
 cd "$repo_root"
 
+# Variant tag (default A = current pilot config). Override per submission:
+#   QWEN_SFT_VARIANT_TAG=B sbatch ...   (then this run lands in qwen-sft-explicit-B/)
+variant_tag="${QWEN_SFT_VARIANT_TAG:-A}"
+calibration_repeats="${QWEN_SFT_CALIBRATION_REPEATS:-3}"
+fallback_sigma="${QWEN_SFT_FALLBACK_SIGMA:-0.0001}"
+gate_tau_min="${QWEN_SFT_GATE_TAU_MIN:-0.1}"
+gate_tau_max="${QWEN_SFT_GATE_TAU_MAX:-0.5}"
+
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-run_root="${QWEN_SFT_EXPLICIT_RUN_ROOT:-$repo_root/artifact/qwen-sft-explicit/run-$timestamp}"
+run_root="${QWEN_SFT_EXPLICIT_RUN_ROOT:-$repo_root/artifact/qwen-sft-explicit-$variant_tag/run-$timestamp}"
 mkdir -p "$run_root"
 
 export TBC_HOME="$run_root/tbc_home"
@@ -60,7 +68,7 @@ export AUTORESEARCH_SHARED_CACHE_ROOT="${AUTORESEARCH_SHARED_CACHE_ROOT:-$HOME/.
 mkdir -p "$AUTORESEARCH_SHARED_CACHE_ROOT"
 export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
 
-export QWEN_SFT_WANDB_GROUP="${QWEN_SFT_WANDB_GROUP:-qwen-sft-explicit-$timestamp}"
+export QWEN_SFT_WANDB_GROUP="${QWEN_SFT_WANDB_GROUP:-qwen-sft-explicit-${variant_tag}-${timestamp}}"
 
 {
   echo "timestamp=$timestamp"
@@ -71,6 +79,11 @@ export QWEN_SFT_WANDB_GROUP="${QWEN_SFT_WANDB_GROUP:-qwen-sft-explicit-$timestam
   echo "tbc_home=$TBC_HOME"
   echo "shared_cache=$AUTORESEARCH_SHARED_CACHE_ROOT"
   echo "wandb_run_group=$QWEN_SFT_WANDB_GROUP"
+  echo "variant_tag=$variant_tag"
+  echo "calibration_repeats=$calibration_repeats"
+  echo "fallback_sigma=$fallback_sigma"
+  echo "gate_tau_min=$gate_tau_min"
+  echo "gate_tau_max=$gate_tau_max"
 } > "$run_root/job.env"
 
 if [[ ! -e /dev/nvidia0 ]]; then
@@ -80,10 +93,15 @@ fi
 
 node "$script_dir/create-explicit.js" \
   --artifact-root "$run_root" \
-  --project-id qwen-sft-explicit \
+  --project-id "qwen-sft-explicit-$variant_tag" \
   --gpu-count 8 \
   --experiment-worker-count 8 \
-  --time-budget-seconds 1200
+  --time-budget-seconds 1200 \
+  --calibration-repeats "$calibration_repeats" \
+  --fallback-sigma "$fallback_sigma" \
+  --gate-tau-min "$gate_tau_min" \
+  --gate-tau-max "$gate_tau_max" \
+  --variant-tag "$variant_tag"
 
 ln -sf "$run_root/projects.yaml" "$TBC_HOME/projects.yaml"
 

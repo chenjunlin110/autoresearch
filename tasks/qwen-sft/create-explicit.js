@@ -34,6 +34,12 @@ const result = createExplicitWorkspace({
   gpuCount: args['gpu-count'] || 8,
   experimentWorkerCount: args['experiment-worker-count'] || args['gpu-count'] || 8,
   agentRuntime: args['agent-runtime'] || process.env.AUTORESEARCH_AGENT_RUNTIME || 'codex_cli',
+  // ALPS-knob sweep parameters
+  calibrationRepeats: args['calibration-repeats'] !== undefined ? Number(args['calibration-repeats']) : 3,
+  fallbackSigma: args['fallback-sigma'] !== undefined ? Number(args['fallback-sigma']) : 0.0001,
+  gateTauMin: args['gate-tau-min'] !== undefined ? Number(args['gate-tau-min']) : 0.1,
+  gateTauMax: args['gate-tau-max'] !== undefined ? Number(args['gate-tau-max']) : 0.5,
+  variantTag: args['variant-tag'] || '',
 });
 
 process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
