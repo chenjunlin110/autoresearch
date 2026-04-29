@@ -75,8 +75,16 @@ package-agnostic.
   - Manual ALPS: job 1581726, post-fix, 65 evals, best 0.9920, one
     KEEP at $t \approx 55$ min.
   - Explicit ALPS: TBD, in progress.
-- **Pilot Qwen-SFT** (Table 2): in flight (job 1581949 queued behind
-  cluster QOS). All rows TBD.
+- **Pilot Qwen-SFT** (Table 2): Manual ALPS row populated from job
+  1584077 (8-GPU × 4 h, claude_cli runtime, EVAL_EVERY_STEPS=20).
+  32 evaluations completed at the snapshot used for the table; best
+  val_loss = 1.10875 (mix `chat=0.125, code=0.165, if=0.150,
+  math=0.280, reasoning=0.280`), $\Delta = -0.00094$ vs uniform
+  baseline (1.10968), zero KEEP directives fired. Noise floor
+  $\hat\sigma = 4 \times 10^{-5}$ from a paired baseline-repeat.
+  Reproducibility: two earlier co-leaders each replicated within
+  $6 \times 10^{-5}$ of original. Naive-parallel, serial, and
+  Explicit-ALPS rows still TBD (separate runs needed).
 - **Ablation table** (Table 3): only "Manual ALPS full" and "−lineage"
   rows populated; the rest are dedicated 1-h runs that swap the
   manager's role in each ALPS decision for explicit code.
