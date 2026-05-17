@@ -10,7 +10,7 @@ configuration; the comparison feeds Table 1 ("Qwen3 SFT mix" rows).
 
 | Item | Value |
 |---|---|
-| Model | `Qwen/Qwen3-0.6B`, bf16, full fine-tune (no LoRA) |
+| Model | `Qwen/Qwen3-0.6B`, bf16, full fine-tune (no LoRA). HF hub id `Qwen/Qwen3-0.6B`; local cache `~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca/` (resolved via `HF_HOME=~/.cache/huggingface`) |
 | Data | Tülu-3 SFT mixture, bucketed into 5 domains (math / code / chat / if / reasoning) by `prepare.py` |
 | Search variable | module-level `DATA_MIX` dict in `source/train.py` (5 weights, trainer normalizes to 1) |
 | Metric | balanced held-out cross-entropy across all 5 buckets, 200 val/bucket = 1000 total (`val_loss`, lower better) |
