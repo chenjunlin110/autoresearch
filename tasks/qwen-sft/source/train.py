@@ -52,22 +52,16 @@ except ImportError:
 # Manager's data-mix decision lives here. Keys must match bucket names from
 # prepare.py's manifest.json. Values are sampling weights; they will be
 # normalized to sum to 1.
-DATA_MIX = {
-    "math":      0.20,
-    "code":      0.20,
-    "chat":      0.20,
-    "if":        0.20,
-    "reasoning": 0.20,
-}
+DATA_MIX = {'math': 0.32, 'code': 0.18, 'chat': 0.10, 'if': 0.10, 'reasoning': 0.30}
 
 DATA_ROOT      = os.path.expanduser("~/.cache/qwen-sft/data")
 MODEL_NAME     = "Qwen/Qwen3-0.6B"
 SEQ_LEN        = 2048
 MICRO_BATCH    = 16
 GRAD_ACCUM     = 2
-LEARNING_RATE  = 2e-5
+LEARNING_RATE  = 3e-5
 WARMUP_STEPS   = 50
-WEIGHT_DECAY   = 0.01
+WEIGHT_DECAY   = 0.0
 GRAD_CKPT      = True
 MAX_STEPS      = 5000
 LOG_EVERY      = 10
